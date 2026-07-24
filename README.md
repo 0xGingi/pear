@@ -7,10 +7,6 @@ deliberately drop** — `.env*` files sync by default, and `.git`
 directories sync so a clone on another machine is a real,
 `git fsck`-clean repository.
 
-Personal project. macOS and Linux are verified; Windows is out of
-scope. The living spec is [DESIGN.md](DESIGN.md) — every contract and
-its as-built notes, §1–§31.
-
 ## What it does
 
 - **One-way sync, two roles.** A *writer* device owns a workspace's
@@ -216,11 +212,3 @@ Layout: `crates/core` (scan/chunk/store/sync/crypto/e2e),
 every milestone §11–§31 has a pinned contract and as-built notes,
 including the perf baselines (5k e2e clone ≈ 37s release; 500k-file
 watcher-load numbers and the current cycle-cost caveat in §27).
-
-## Caveats
-
-- Personal project: no support channel, no Windows, no promises.
-- Single writer per workspace at a time; merging is out of scope by
-  design (the lease + takeover flow is the answer).
-- Very large trees (500k+ files) work — measured in §27 — but each
-  change-triggered cycle costs tens of seconds there.
