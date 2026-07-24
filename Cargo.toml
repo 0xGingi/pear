@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+# Thin LTO for release: meaningful speedup on the chunk/hash hot paths
+# for modest build cost. Perf baselines are re-measured in release mode
+# (DESIGN.md §15).
+[profile.release]
+lto = "thin"

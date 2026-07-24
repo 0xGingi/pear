@@ -1,0 +1,23 @@
+[package]
+name = "pear"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "peard"
+path = "src/bin/peard.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+pear-core = { path = "../core" }
+serde_json = "1"
+whoami = "1"
+
+[dev-dependencies]
+# The rekey test drives `pear rekey` against a real relay (the same
+# workspace crates pear-core's dev-dependencies already use — no new
+# external dependency).
+pear-relay = { path = "../relay" }
+tempfile = "3"
+tokio = { version = "1", features = ["net", "rt-multi-thread", "time"] }
