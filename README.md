@@ -16,10 +16,6 @@ shows up on every other one, usually in under a second.
 pear join ~/proj --relay http://relay:7700
 ```
 
-Personal project. macOS and Linux are verified; Windows is out of
-scope. The living spec is [DESIGN.md](DESIGN.md) — every contract and
-its as-built notes, §1–§32.
-
 ## Quickstart
 
 Build (three binaries land in `target/release/`: `pear` the CLI,
@@ -232,15 +228,3 @@ Layout: `crates/core` (scan/chunk/store/sync/merge/converge/crypto/e2e),
 every milestone §11–§32 has a pinned contract and as-built notes,
 including the perf baselines (5k e2e clone ≈ 37s release; 500k-file
 watcher-load numbers and the current cycle-cost caveat in §27).
-
-## Caveats
-
-- Personal project: no support channel, no Windows, no promises.
-- Conflict resolution is last-writer-wins by mtime plus a conflict
-  copy — not a semantic merge. Two people editing the same file at
-  the same second get one winner and one clearly named loser file.
-- Under end-to-end encryption, identical files written by two devices
-  do not dedup against each other (chunks are addressed by
-  ciphertext).
-- Very large trees (500k+ files) work — measured in §27 — but each
-  change-triggered cycle costs tens of seconds there.
