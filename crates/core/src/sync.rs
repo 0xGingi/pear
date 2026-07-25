@@ -534,29 +534,35 @@ pub struct PushReport {
     pub committed: bool,
 }
 
-/// Why a push failed. Fenced/head-conflict are fatal to the writer: it no
-/// longer owns the head (§11). Anything else is transient and retryable.
+/// Why a push failed. §32: a head conflict is the ordinary outcome of
+/// concurrent writers — converge re-merges against the winning head and
+/// retries. `Client` is deterministic and fatal; anything else is
+/// transient and retryable.
 #[derive(Debug)]
 pub enum PushError {
-    Fenced(String),
     HeadConflict {
         current_seq: u64,
     },
-    /// A deterministic rejection (HTTP 4xx other than fencing/conflict —
-    /// bad token, invalid manifest, version skew): retrying cannot help.
+    /// HTTP 403 anywhere on the write path: this device has no Writer
+    /// role on the workspace. Typed apart from `Client` so §32's converge
+    /// loop can degrade to a read-only mirror instead of dying.
+    Forbidden(String),
+    /// A deterministic rejection (HTTP 4xx other than a CAS conflict or a
+    /// role failure — bad token, invalid manifest, version skew):
+    /// retrying cannot help.
     Client(String),
     Other(anyhow::Error),
 }
 
 impl PushError {
-    fn from_relay(e: RelayError) -> Self {
+    pub(crate) fn from_relay(e: RelayError) -> Self {
         match e {
-            RelayError::Fenced(why) => PushError::Fenced(why),
             RelayError::HeadConflict { current_seq } => PushError::HeadConflict { current_seq },
             RelayError::Fatal(msg) => PushError::Client(msg),
+            RelayError::Http { status: 403, body } => PushError::Forbidden(body),
             // Only the relay contract's own deterministic statuses are
             // fatal; transient 4xx from intermediaries (408, 429) retries.
-            RelayError::Http { status, body } if matches!(status, 400 | 401 | 403 | 404) => {
+            RelayError::Http { status, body } if matches!(status, 400 | 401 | 404) => {
                 PushError::Client(format!(
                     "relay rejected the request (HTTP {status}): {body}"
                 ))
@@ -570,7 +576,7 @@ impl PushError {
 /// `RelayError` into `io::Error`, which hides it from `source()` but
 /// exposes it via `get_ref()` — deterministic auth/role failures
 /// (401/403/404) still go fatal instead of retrying forever.
-fn push_from_anyhow(e: anyhow::Error) -> PushError {
+pub(crate) fn push_from_anyhow(e: anyhow::Error) -> PushError {
     fn classify(err: &(dyn std::error::Error + 'static)) -> Option<PushError> {
         if let Some(relay) = err.downcast_ref::<RelayError>() {
             return push_from_relay_ref(relay);
@@ -603,11 +609,11 @@ fn push_from_anyhow(e: anyhow::Error) -> PushError {
 
 fn push_from_relay_ref(e: &RelayError) -> Option<PushError> {
     match e {
-        RelayError::Fenced(why) => Some(PushError::Fenced(why.clone())),
         RelayError::HeadConflict { current_seq } => Some(PushError::HeadConflict {
             current_seq: *current_seq,
         }),
-        RelayError::Http { status, body } if matches!(status, 400 | 401 | 403 | 404) => {
+        RelayError::Http { status: 403, body } => Some(PushError::Forbidden(body.clone())),
+        RelayError::Http { status, body } if matches!(status, 400 | 401 | 404) => {
             Some(PushError::Client(format!(
                 "relay rejected the request (HTTP {status}): {body}"
             )))
@@ -619,9 +625,11 @@ fn push_from_relay_ref(e: &RelayError) -> Option<PushError> {
 impl fmt::Display for PushError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PushError::Fenced(why) => write!(f, "fenced: {why}"),
             PushError::HeadConflict { current_seq } => {
                 write!(f, "head conflict: relay head is at seq {current_seq}")
+            }
+            PushError::Forbidden(why) => {
+                write!(f, "relay refused the write (HTTP 403, no writer role): {why}")
             }
             PushError::Client(why) => write!(f, "{why}"),
             PushError::Other(e) => write!(f, "{e:#}"),
@@ -639,10 +647,9 @@ impl From<anyhow::Error> for PushError {
 
 /// One writer cycle against the relay (§11): scan -> chunk -> upload only
 /// the chunks the relay is missing (batch check) -> `PUT /head` with
-/// `base_seq` and the lease headers. 409/403 surface as typed errors: the
-/// writer no longer owns the head and must stop, not retry. `force_commit`
-/// commits even when the scan matches the local cache: right after a
-/// forced takeover the contract is "this tree becomes the head".
+/// `base_seq`. A 409 surfaces as `HeadConflict`: this cycle's base is
+/// stale (§32: converge re-merges against the winner). `force_commit`
+/// commits even when the scan matches the local cache.
 pub fn push_cycle(
     source: &Path,
     client: &RelayClient,
@@ -657,7 +664,7 @@ pub fn push_cycle(
 /// ciphertext hash — unchanged files keep their cached ciphertext hashes
 /// via the ordinary scan-cache reuse, so a rotation re-uploads nothing
 /// but the next real edits), and the head commits the encrypted manifest
-/// plus the ciphertext chunk list. All scan/CAS/fencing semantics are the
+/// plus the ciphertext chunk list. All scan/CAS semantics are the
 /// plaintext cycle's, unchanged.
 pub fn push_cycle_e2e(
     source: &Path,
@@ -711,7 +718,7 @@ fn push_inner(
         )
         .into());
     }
-    // §28: the workspace's team forbids `.env` sync (learned at watch
+    // §28: the workspace's team forbids `.env` sync (learned at loop
     // startup) and the scan captured `.env*` files — REFUSE the cycle
     // before anything uploads. Deterministic: retrying cannot help until
     // the files go or the policy lifts, so this is `Client`, which the
@@ -779,7 +786,7 @@ fn push_inner(
             // commit: base+1 holding exactly the manifest we attempted.
             // Compare file sets, not the per-cycle scan timestamp — the
             // retrying cycle scans with a fresh `scanned_at_secs`, so
-            // whole-struct equality would spuriously fail and self-fence.
+            // whole-struct equality would spuriously fail and re-push.
             // (E2E heads re-encrypt per commit — random nonce — so the
             // comparison decrypts the relay's head with our key.)
             Err(RelayError::HeadConflict { current_seq }) if current_seq == base_seq + 1 => {
@@ -800,7 +807,7 @@ fn push_inner(
         };
         head_seq = commit.seq;
         committed = true;
-        // Persist what this device knows of the head: watch startup reads
+        // Persist what this device knows of the head: loop startup reads
         // it to prove a resume is not a rewind (§11 writer guard).
         let state = serde_json::to_vec(&RemoteState {
             seq: commit.seq,
@@ -877,37 +884,36 @@ impl PullReport {
 /// state — kept in `.pear/remote.json` so a restart does not re-apply
 /// the same head.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct RemoteState {
-    seq: u64,
-    hash: String,
+pub(crate) struct RemoteState {
+    pub(crate) seq: u64,
+    pub(crate) hash: String,
     /// Fingerprint of the last committed file set (writers only; absent
     /// on mirrors). The writer's commit gate compares the scanned tree
     /// against THIS, not against the shared scan cache: a local
     /// `pear sync` writing that cache must never hide edits from the
     /// relay (§14 autoreview).
     #[serde(default)]
-    files_fingerprint: Option<String>,
+    pub(crate) files_fingerprint: Option<String>,
 }
 
 /// A stable fingerprint of a manifest's file set (canonical JSON under
 /// BLAKE3), recorded as the writer's last-committed tree.
-fn fingerprint_files(files: &std::collections::BTreeMap<String, manifest::FileEntry>) -> String {
+pub(crate) fn fingerprint_files(files: &std::collections::BTreeMap<String, manifest::FileEntry>) -> String {
     blake3::hash(&serde_json::to_vec(files).expect("file map serializes"))
         .to_hex()
         .to_string()
 }
 
-fn remote_state_path(mirror: &Path) -> PathBuf {
+pub(crate) fn remote_state_path(mirror: &Path) -> PathBuf {
     mirror.join(".pear").join("remote.json")
 }
 
-fn load_remote_state(mirror: &Path) -> Option<RemoteState> {
+pub(crate) fn load_remote_state(mirror: &Path) -> Option<RemoteState> {
     let data = fs::read(remote_state_path(mirror)).ok()?;
     serde_json::from_slice(&data).ok()
 }
 
-/// The head seq this mirror last applied (`.pear/remote.json`), if any —
-/// what a checkout offers as its synced-to-head proof (§11).
+/// The head seq this mirror last applied (`.pear/remote.json`), if any.
 pub fn last_applied_seq(mirror: &Path) -> Option<u64> {
     load_remote_state(mirror).map(|s| s.seq)
 }
@@ -937,15 +943,15 @@ pub fn writer_base_seq(source: &Path, client: &RelayClient, force: bool) -> Resu
     bail!(
         "this device knows head seq {local} but the relay is at {relay_seq}; \
          `pear snapshot` preserves this tree as a snapshot first, then \
-         `pear mirror` adopts the relay head (can overwrite local changes) or \
-         `pear watch --relay --force` makes this tree the head instead"
+         `pear mirror` adopts the relay head (can overwrite local changes); \
+         §32's `pear join` merges the two sides instead of choosing"
     )
 }
 
 /// Load the mirror's local manifest. A corrupt one can never heal by
 /// retrying the same head — operator action is required — so it is
 /// Fatal, not a transient poll error.
-fn load_mirror_manifest(mirror: &Path) -> Result<Option<Manifest>> {
+pub(crate) fn load_mirror_manifest(mirror: &Path) -> Result<Option<Manifest>> {
     manifest::load(&mirror.join(".pear").join("manifest.json")).map_err(|e| {
         anyhow::Error::new(RelayError::Fatal(format!(
             "local manifest is unreadable (delete .pear/manifest.json to re-clone): {e:#}"
@@ -992,7 +998,7 @@ pub fn pull_once_e2e(
 /// full `size` still counts against its batch (dedupe can over-estimate a
 /// batch's wire bytes, never under-estimate). Batches come back in fetch
 /// order; their concatenation is the deduped need list.
-fn plan_fetch_batches(needed: &[(String, &FileEntry)]) -> Vec<Vec<String>> {
+pub(crate) fn plan_fetch_batches(needed: &[(String, &FileEntry)]) -> Vec<Vec<String>> {
     let mut batches: Vec<Vec<String>> = Vec::new();
     let mut current: Vec<String> = Vec::new();
     let mut current_bytes = 0u64;
@@ -1077,7 +1083,7 @@ fn pull_inner(
         if load_remote_state(&mirror).is_some() {
             bail!(
                 "relay workspace {} has no head, but this mirror has applied state \
-                 (relay wiped?); `pear watch --relay --force` on the writer restores it",
+                 (relay wiped?); `pear join` on a writer republishes it",
                 meta.id
             );
         }

@@ -1,7 +1,7 @@
 //! §29 real-git recovery UX tests: §10's `.git` risk ("recovery UX needs
 //! real testing before teams trust it") exercised with REAL git repositories
 //! — driven by the real `git` binary (init, commits on two branches, a
-//! merge, an annotated tag, fsck, checkout) — on top of the real relay and
+//! merge, an annotated tag, fsck, branch switching) — on top of the real relay and
 //! the real pear-core writer/mirror flows, exactly like `e2e.rs` does with
 //! synthetic `.git` trees. Every test skips cleanly (early return, not a
 //! failure) when no `git` binary is on PATH. No network beyond the local
@@ -18,21 +18,22 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use pear_core::converge::converge_once;
 use pear_core::relay::RelayClient;
-use pear_core::sync::{pull_once, push_cycle, PushError};
+use pear_core::sync::{pull_once, push_cycle};
 
 const TOKEN: &str = "e2e-token";
 
 // --- relay fixture (same shape as e2e.rs) -------------------------------------
 
 /// Spawn the relay on an ephemeral port; return its base URL.
-async fn start_relay(data_dir: &Path, lease_ttl_secs: u64) -> String {
+async fn start_relay(data_dir: &Path) -> String {
     // Bind first and pass the listener: no bind-then-drop port race.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let dir = data_dir.to_path_buf();
     tokio::spawn(async move {
-        pear_relay::serve_on(listener, TOKEN, &dir, lease_ttl_secs)
+        pear_relay::serve_on(listener, TOKEN, &dir)
             .await
             .expect("relay serve failed");
     });
@@ -197,7 +198,7 @@ async fn real_git_round_trip() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let url = start_relay(&tmp.path().join("relay"), 300).await;
+    let url = start_relay(&tmp.path().join("relay")).await;
     let git_cfg = tmp.path().join("empty-gitconfig");
     std::fs::write(&git_cfg, b"").unwrap();
 
@@ -229,7 +230,6 @@ async fn real_git_round_trip() {
     let writer = RelayClient::new(&url, TOKEN, &meta.id, "device-a");
     wait_ready(&url).await;
     writer.create_workspace("a").unwrap();
-    writer.acquire().unwrap();
     let pushed = push_cycle(&dir_a, &writer, 0, false).unwrap();
     assert_eq!(pushed.head_seq, 1);
 
@@ -290,7 +290,7 @@ async fn real_git_live_edit_loop_with_mirror_side_commit() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let url = start_relay(&tmp.path().join("relay"), 300).await;
+    let url = start_relay(&tmp.path().join("relay")).await;
     let git_cfg = tmp.path().join("empty-gitconfig");
     std::fs::write(&git_cfg, b"").unwrap();
 
@@ -306,7 +306,6 @@ async fn real_git_live_edit_loop_with_mirror_side_commit() {
     let writer = RelayClient::new(&url, TOKEN, &meta.id, "device-a");
     wait_ready(&url).await;
     writer.create_workspace("a").unwrap();
-    writer.acquire().unwrap();
     let pushed = push_cycle(&dir_a, &writer, 0, false).unwrap();
     assert_eq!(pushed.head_seq, 1);
 
@@ -390,27 +389,41 @@ async fn real_git_live_edit_loop_with_mirror_side_commit() {
     );
 }
 
-/// §29 force-takeover fork: two writers on one workspace diverge offline
-/// (both commit different work). The second forces the head (`pear watch
-/// --relay --force` semantics: `writer_base_seq(.., force)` -> `force()` ->
-/// takeover `push_cycle`, the same calls the CLI makes). The contract
-/// (§5/§11/§12): the relay checkpoints the overwritten head at force time,
-/// the stranded side's resume is refused with `pear snapshot` as the
-/// preserve-first remedy, its push is fenced, and the divergent snapshot it
-/// makes preserves the stranded tree — a clone from it contains the
-/// stranded git work, fsck-clean. Nothing is silently lost on either side.
+/// §32 multi-writer over a REAL git repo: two devices diverge offline
+/// (each commits different work), then both run the converge loop. The
+/// contract: both sides' work lands, both trees end byte-identical, and
+/// the divergent `.git` refs that both devices moved are resolved by
+/// last-writer-wins with the loser preserved as a conflict copy —
+/// nothing is silently lost on either side.
+///
+/// What actually happens to git (pinned by assertion, per §29's "document
+/// what actually happens"): `.git` objects are content-addressed and
+/// disjoint, so BOTH devices' commits survive in `.git/objects`; the
+/// mutable refs (`HEAD`, `refs/heads/main`, the index) are single files
+/// that both sides changed, so LWW picks one lineage as the live one. The
+/// loser's commit is then dangling-but-recoverable (`git fsck
+/// --lost-found`), exactly the state a local `git reset` leaves.
+///
+/// The loser's ref bytes are NOT written beside the winner: a conflict
+/// copy inside `.git/` is an invalid refname, and syncing one would make
+/// `git fsck --strict` report `badRefName` on every device. §32's
+/// as-built `.git` rule keeps those copies out of the manifest and out of
+/// the tree, preserving them under `.pear/conflicts/<path> (conflict from
+/// …)` on the device that made them — asserted below, together with a
+/// CLEAN `git fsck --strict` on both repositories.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn real_git_force_takeover_fork_preserves_stranded_work() {
+async fn real_git_two_writers_converge_without_losing_work() {
     if !git_available() {
         eprintln!("skipping: git not on PATH");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let url = start_relay(&tmp.path().join("relay"), 300).await;
+    let url = start_relay(&tmp.path().join("relay")).await;
     let git_cfg = tmp.path().join("empty-gitconfig");
     std::fs::write(&git_cfg, b"").unwrap();
 
-    // Device A writes a real repo and pushes it; device B mirrors it.
+    // Device A writes a real repo and converges it; device B joins the
+    // same workspace and converges (materializing the tree).
     let dir_a = tmp.path().join("a");
     let a = Repo::init(&dir_a, &git_cfg);
     a.commit_file(".gitignore", b".pear/\n", "ignore pear metadata");
@@ -421,103 +434,116 @@ async fn real_git_force_takeover_fork_preserves_stranded_work() {
     let device_a = RelayClient::new(&url, TOKEN, &meta.id, "device-a");
     wait_ready(&url).await;
     device_a.create_workspace("a").unwrap();
-    device_a.acquire().unwrap();
-    let pushed = push_cycle(&dir_a, &device_a, 0, false).unwrap();
-    assert_eq!(pushed.head_seq, 1);
+    let report = converge_once(&dir_a, &device_a, "device-a", None).unwrap();
+    assert!(report.pushed);
+    assert_eq!(report.head_seq, 1);
 
     let dir_b = tmp.path().join("b");
-    pear_core::init_workspace(&dir_b, Some(&meta.id)).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
     let device_b = RelayClient::new(&url, TOKEN, &meta.id, "device-b");
-    assert!(pull_once(&dir_b, &device_b).unwrap().changed);
+    let report = converge_once(&dir_b, &device_b, "device-b", None).unwrap();
+    assert!(!report.pushed, "B adopts the head it just materialized");
     let b = Repo::attach(&dir_b, &git_cfg);
     assert_eq!(b.head(), a.head(), "B starts converged");
 
-    // Both sides commit DIFFERENT work "offline" (no push in between). A
-    // also has an uncommitted file — unsynced state beyond the git commit.
-    a.commit_file("stranded.rs", b"pub fn stranded() {}\n", "a: stranded work");
-    let a_stranded = a.head();
-    write(&dir_a, "unsynced.txt", b"a was here, never pushed\n");
-    b.commit_file("b-work.rs", b"pub fn b_work() {}\n", "b: takeover work");
-    let b_head = b.head();
+    // Both sides commit DIFFERENT work "offline" (no converge between).
+    a.commit_file("a-work.rs", b"pub fn a_work() {}\n", "a: offline work");
+    let a_commit = a.head();
+    b.commit_file("b-work.rs", b"pub fn b_work() {}\n", "b: offline work");
+    let b_commit = b.head();
+    assert_ne!(a_commit, b_commit, "the repos really diverged");
 
-    // B force-takes the workspace (the CLI's `pear watch --relay --force`
-    // sequence) and makes its tree the head.
-    let base = pear_core::sync::writer_base_seq(&dir_b, &device_b, true).unwrap();
-    assert_eq!(base, 1);
-    device_b.force().unwrap();
-    let pushed = push_cycle(&dir_b, &device_b, base, true).unwrap();
-    assert_eq!(pushed.head_seq, 2, "B's tree is the new head");
-
-    // The relay checkpointed the overwritten head first (§12): kind
-    // "checkpoint", recorded under the outgoing holder, and it is the
-    // PRE-fork tree (none of B's post-fork work).
-    let snapshots = device_a.list_snapshots().unwrap();
-    assert_eq!(snapshots.len(), 1);
-    assert_eq!(snapshots[0].kind, "checkpoint");
-    assert_eq!(snapshots[0].device, "device-a");
-    let checkpoint = device_a.get_snapshot(snapshots[0].id).unwrap();
-    assert!(checkpoint.manifest.files.contains_key(".git/HEAD"));
+    // Both converge. A goes first and wins the CAS; B re-merges against
+    // A's head (converge_once retries internally) and publishes the union.
+    let report_a = converge_once(&dir_a, &device_a, "device-a", None).unwrap();
+    assert!(report_a.pushed);
+    let report_b = converge_once(&dir_b, &device_b, "device-b", None).unwrap();
+    assert!(report_b.pushed, "B publishes the merge");
     assert!(
-        !checkpoint.manifest.files.contains_key("b-work.rs"),
-        "the checkpoint is the pre-fork head"
+        !report_b.conflict_copies.is_empty(),
+        "both sides moved the same refs: the loser is preserved"
     );
 
-    // A reconnects with its unsynced work: resume is refused and the
-    // refusal OFFERS the divergent-snapshot remedy (§11's preserve-first);
-    // its push is fenced (stale generation).
-    let err = pear_core::sync::writer_base_seq(&dir_a, &device_a, false).unwrap_err();
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("pear snapshot"),
-        "the stranded side is offered the preserve-first remedy: {msg}"
-    );
-    let err = push_cycle(&dir_a, &device_a, base, false).unwrap_err();
-    assert!(matches!(err, PushError::Fenced(_)), "got {err:?}");
+    // A converges once more to take B's merged head, and the two trees are
+    // now byte-identical.
+    converge_once(&dir_a, &device_a, "device-a", None).unwrap();
+    assert_eq!(tree(&dir_a), tree(&dir_b), "both devices converged");
 
-    // A makes the divergent snapshot (§12: a `named` snapshot of unsynced
-    // local state; snapshots have no fencing/CAS, so the stranded device
-    // can always preserve). The head does not move.
-    let snap = pear_core::snapshot::push_snapshot(&dir_a, &device_a, Some("a-stranded")).unwrap();
-    assert_eq!(device_a.get_head().unwrap().unwrap().seq, 2);
-    let snapshots = device_a.list_snapshots().unwrap();
-    assert_eq!(snapshots[0].id, snap.id);
-    assert_eq!(snapshots[0].kind, "named");
-    assert_eq!(snapshots[0].name.as_deref(), Some("a-stranded"));
+    // BOTH devices' worktree files are present on BOTH sides: §32's
+    // invariant is that a converge never loses a byte of user data.
+    for dir in [&dir_a, &dir_b] {
+        assert!(dir.join("a-work.rs").exists(), "A's file in {dir:?}");
+        assert!(dir.join("b-work.rs").exists(), "B's file in {dir:?}");
+    }
 
-    // A clone from that snapshot contains the stranded work — the git
-    // commit (recoverable, fsck-clean repo) AND the uncommitted file.
-    let dir_c = tmp.path().join("c");
-    let cloner = RelayClient::new(&url, TOKEN, &meta.id, "device-c");
-    pear_core::snapshot::clone_from_snapshot(&dir_c, &cloner, snap.id).unwrap();
-    let c = Repo::attach(&dir_c, &git_cfg);
-    c.fsck_strict();
-    assert_eq!(c.head(), a_stranded, "the stranded commit is HEAD in the clone");
+    // BOTH commits are still reachable as objects on BOTH devices (the
+    // LWW loser is dangling, not gone), and the live ref is intact.
+    for (repo, dir) in [(&a, &dir_a), (&b, &dir_b)] {
+        for commit in [&a_commit, &b_commit] {
+            let kind = repo.run(&["cat-file", "-t", commit]);
+            assert_eq!(kind, "commit", "{commit} survives in {dir:?}");
+        }
+        let head = repo.head();
+        assert!(
+            head == a_commit || head == b_commit,
+            "one lineage is live in {dir:?}, got {head}"
+        );
+    }
+    // The `.git` rule, pinned: every conflict copy of this converge is a
+    // local-only file under `.pear/conflicts/`, none of them inside the
+    // repository — so BOTH repositories stay `git fsck --strict` clean...
     assert!(
-        c.log_oneline().contains("a: stranded work"),
-        "the stranded work is in the clone's history"
+        report_b
+            .conflict_copies
+            .iter()
+            .any(|p| p.starts_with(".pear/conflicts/.git/")),
+        "the ref conflict is preserved outside the repo: {:?}",
+        report_b.conflict_copies
     );
+    assert!(
+        report_b
+            .conflict_copies
+            .iter()
+            .all(|p| p.starts_with(".pear/conflicts/")),
+        "no conflict copy may land inside .git: {:?}",
+        report_b.conflict_copies
+    );
+    a.fsck_strict();
+    b.fsck_strict();
+    // ...and the losing side's bytes are on the device that lost them,
+    // byte-identical to what its `.git` held before the converge.
+    for copy in &report_b.conflict_copies {
+        let preserved = dir_b.join(copy);
+        assert!(preserved.is_file(), "{copy} must exist on device B");
+        assert!(
+            !std::fs::read(&preserved).unwrap().is_empty(),
+            "{copy} holds the loser's bytes"
+        );
+    }
+    // The losing lineage's ref value is recoverable from the copy: it
+    // names the commit that lost, and git still has that object.
+    let loser = if b.head() == a_commit { &b_commit } else { &a_commit };
+    let ref_copy = report_b
+        .conflict_copies
+        .iter()
+        .find(|p| p.starts_with(".pear/conflicts/.git/refs/heads/main"))
+        .expect("both devices moved refs/heads/main");
     assert_eq!(
-        std::fs::read(dir_c.join("unsynced.txt")).unwrap(),
-        b"a was here, never pushed\n",
-        "even the uncommitted stranded state is preserved"
-    );
-    assert_eq!(c.status_porcelain(), "?? unsynced.txt");
-    assert!(
-        !dir_c.join("b-work.rs").exists(),
-        "the fork is real: B's work is not in A's snapshot"
+        std::fs::read_to_string(dir_b.join(ref_copy)).unwrap().trim(),
+        *loser,
+        "the preserved ref still points at the losing commit"
     );
 
-    // The fork's winner is fully usable: a fresh mirror converges on B's
-    // tree, repo healthy, A's stranded file absent (it lives only in the
-    // divergent snapshot — explicit, never silently merged, per §5).
-    let dir_d = tmp.path().join("d");
-    pear_core::init_workspace(&dir_d, Some(&meta.id)).unwrap();
-    let device_d = RelayClient::new(&url, TOKEN, &meta.id, "device-d");
-    assert!(pull_once(&dir_d, &device_d).unwrap().changed);
-    let d = Repo::attach(&dir_d, &git_cfg);
-    d.fsck_strict();
-    assert_eq!(d.head(), b_head);
-    assert_eq!(d.status_porcelain(), "");
-    assert!(dir_d.join("b-work.rs").exists());
-    assert!(!dir_d.join("stranded.rs").exists());
+    // A fresh mirror sees exactly the converged head, both sides' work
+    // included.
+    let dir_c = tmp.path().join("c");
+    pear_core::init_workspace(&dir_c, Some(&meta.id)).unwrap();
+    let device_c = RelayClient::new(&url, TOKEN, &meta.id, "device-c");
+    assert!(pull_once(&dir_c, &device_c).unwrap().changed);
+    let c = Repo::attach(&dir_c, &git_cfg);
+    assert!(dir_c.join("a-work.rs").exists());
+    assert!(dir_c.join("b-work.rs").exists());
+    for commit in [&a_commit, &b_commit] {
+        assert_eq!(c.run(&["cat-file", "-t", commit]), "commit");
+    }
 }

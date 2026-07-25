@@ -1,11 +1,13 @@
 pub mod apply;
 pub mod chunk;
 pub mod chunk_frame;
+pub mod converge;
 pub mod crypto;
 pub mod e2e;
 mod fsutil;
 pub mod known_keys;
 pub mod manifest;
+pub mod merge;
 pub mod relay;
 pub mod scan;
 pub mod snapshot;
@@ -64,8 +66,8 @@ pub fn init_workspace(path: &Path, id: Option<&str>) -> Result<(WorkspaceMeta, b
 }
 
 /// Load workspace metadata without creating anything: flows that must
-/// target an existing workspace (checkout) use this instead of
-/// `init_workspace`, which would otherwise mint a fresh id.
+/// target an existing workspace (`snapshot`, `rekey`, `share`) use this
+/// instead of `init_workspace`, which would otherwise mint a fresh id.
 pub fn load_workspace(path: &Path) -> Result<Option<WorkspaceMeta>> {
     let meta_path = path.join(".pear").join("workspace.json");
     match fs::read(&meta_path) {

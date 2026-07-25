@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use loops::{
-    find_team, hostname, human_bytes, print_pull_report, print_push_report, print_report,
+    find_team, hostname, human_bytes, print_converge_report, print_pull_report, print_report,
     print_rotation_report, print_wrap_report, workspace_name, LoopControl,
 };
 use pear_core::relay::{RelayClient, RelayError};
@@ -35,6 +35,43 @@ struct RelayTls {
     /// skip-verify mode.
     #[arg(long, env = "PEAR_TLS_CA")]
     tls_ca_cert: Option<PathBuf>,
+}
+
+/// The §32 converge flags, shared by `pear join` and `pear sync --relay`.
+/// Every one of them is optional except the relay itself: joining is meant
+/// to be one command.
+#[derive(clap::Args)]
+struct ConvergeArgs {
+    /// Relay base URL. On `sync` it is what switches the command from a
+    /// single local cycle to the §32 converge loop.
+    #[arg(long)]
+    relay: Option<String>,
+    /// Join an EXISTING relay workspace by id (into an empty directory,
+    /// the first converge materializes it). Without it, this directory's
+    /// own workspace is created on the relay.
+    #[arg(long, requires = "relay")]
+    workspace: Option<String>,
+    /// Bearer token; defaults to the PEAR_TOKEN env var.
+    #[arg(long, requires = "relay")]
+    token: Option<String>,
+    /// Device id recorded on head commits; defaults to the hostname. It
+    /// also names the conflict copies this device creates (§32).
+    #[arg(long, requires = "relay")]
+    device: Option<String>,
+    /// Attach the workspace to this team at register (§13).
+    #[arg(long, requires = "relay")]
+    team: Option<String>,
+    /// Register the workspace end-to-end encrypted (§17) — the workspace
+    /// key never leaves your devices; immutable once registered.
+    #[arg(long, requires = "relay")]
+    e2e: bool,
+    /// Your user name (the one you enrolled with `pear user keygen`) —
+    /// needed the first time this device joins an e2e workspace someone
+    /// else created, so pear can fetch and unwrap your wrapped key (§17).
+    #[arg(long, requires = "relay")]
+    name: Option<String>,
+    #[command(flatten)]
+    tls: RelayTls,
 }
 
 #[derive(Subcommand)]
@@ -92,48 +129,48 @@ enum Commands {
         /// Bearer token; defaults to the PEAR_TOKEN env var.
         #[arg(long)]
         token: Option<String>,
+        /// Local identity name (`pear user keygen --name`): §32 merges the
+        /// relay's copy of this user's wrapped keyring in before rotating.
+        #[arg(long)]
+        name: Option<String>,
         #[command(flatten)]
         tls: RelayTls,
     },
     /// Initialize a directory as a pear workspace.
     Init { path: PathBuf },
-    /// Run one sync cycle from SOURCE into TARGET.
-    Sync { source: PathBuf, target: PathBuf },
+    /// Local mode: run one sync cycle from SOURCE into TARGET.
+    /// Relay mode (--relay): run the §32 converge loop in the foreground —
+    /// what `join` registers with peard, for debugging and CI.
+    Sync {
+        source: PathBuf,
+        target: Option<PathBuf>,
+        #[command(flatten)]
+        converge: ConvergeArgs,
+        /// Register with the running peard daemon instead of converging in
+        /// the foreground.
+        #[arg(long, requires = "relay")]
+        daemon: bool,
+    },
+    /// The one-time front door (§32): start converging PATH with the relay
+    /// and keep it converging — registers with peard, starting the daemon
+    /// if it is not up. After `join` there is nothing left to run.
+    Join {
+        path: PathBuf,
+        #[command(flatten)]
+        converge: ConvergeArgs,
+    },
     /// Local mode: initial sync, then watch SOURCE and keep TARGET converged.
-    /// Writer mode (--relay): hold the workspace lease and push every cycle.
     /// With --daemon, register with the running peard instead (§16).
     Watch {
         source: PathBuf,
-        target: Option<PathBuf>,
-        /// Relay base URL; switches watch into multi-device writer mode.
-        #[arg(long)]
-        relay: Option<String>,
-        /// Bearer token; defaults to the PEAR_TOKEN env var.
-        #[arg(long, requires = "relay")]
-        token: Option<String>,
-        /// Device id for the lease; defaults to the hostname.
-        #[arg(long, requires = "relay")]
-        device: Option<String>,
-        /// Writer mode only: take the lease by force and make this tree the
-        /// head, even if that strands another writer's changes.
-        #[arg(long, requires = "relay")]
-        force: bool,
-        /// Writer mode only: attach the workspace to this team at register.
-        #[arg(long, requires = "relay")]
-        team: Option<String>,
-        /// Writer mode only: register and push the workspace end-to-end
-        /// encrypted (§17) — the workspace key never leaves your devices;
-        /// immutable once registered.
-        #[arg(long, requires = "relay")]
-        e2e: bool,
+        target: PathBuf,
         /// Register with the running peard daemon instead of watching in
         /// the foreground.
         #[arg(long)]
         daemon: bool,
-        #[command(flatten)]
-        tls: RelayTls,
     },
-    /// Mirror a relay workspace into PATH, applying the writer's changes.
+    /// Mirror a relay workspace into PATH read-only, applying the
+    /// writers' changes (§32: `join` is the read-write front door).
     /// With --daemon, register with the running peard instead (§16).
     Mirror {
         path: PathBuf,
@@ -168,26 +205,8 @@ enum Commands {
         #[command(subcommand)]
         command: DaemonCommand,
     },
-    /// Move the workspace lease to this device (writer handoff).
-    Checkout {
-        path: PathBuf,
-        /// Relay base URL.
-        #[arg(long)]
-        relay: String,
-        /// Bearer token; defaults to the PEAR_TOKEN env var.
-        #[arg(long)]
-        token: Option<String>,
-        /// Device id for the lease; defaults to the hostname.
-        #[arg(long)]
-        device: Option<String>,
-        /// Revoke the current lease instead of asking for a transfer.
-        #[arg(long)]
-        force: bool,
-        #[command(flatten)]
-        tls: RelayTls,
-    },
     /// Preserve the local tree as a snapshot on the relay — head-synced or
-    /// not. This is how unsynced state survives a mirror/force decision.
+    /// not. An immutable, named point you can clone back later.
     Snapshot {
         path: PathBuf,
         /// Snapshot name/message.
@@ -344,7 +363,7 @@ enum TeamCommand {
     /// Remove a member from a team (§20): team owner, or yourself to
     /// leave. Idempotent — removing a non-member is a no-op. The departed
     /// member's wrapped workspace keys die with the membership; the crypto
-    /// cutoff (key rotation) follows at the writer's next watch start.
+    /// cutoff (key rotation) follows at the writers' next loop start.
     Remove {
         team: String,
         /// User name to remove.
@@ -394,8 +413,8 @@ enum TeamCommand {
 
 #[derive(Subcommand)]
 enum DaemonCommand {
-    /// Ask peard to shut down cleanly: loops finish their current cycle,
-    /// leases are left to expire (§16).
+    /// Ask peard to shut down cleanly: loops finish their current cycle
+    /// (§16; §32 holds nothing relay-side to release).
     Stop,
 }
 
@@ -507,8 +526,9 @@ fn main() -> Result<()> {
             path,
             relay,
             token,
+            name,
             tls,
-        } => rekey(&path, &relay, token, &tls)?,
+        } => rekey(&path, &relay, token, name.as_deref(), &tls)?,
         Commands::Init { path } => {
             let (meta, created) = pear_core::init_workspace(&path, None)?;
             if created {
@@ -517,70 +537,47 @@ fn main() -> Result<()> {
                 println!("workspace already initialized (id {})", meta.id);
             }
         }
-        Commands::Sync { source, target } => {
-            let report = pear_core::sync::sync_cycle(&source, &target)?;
-            print_report(&report);
-        }
+        Commands::Sync {
+            source,
+            target,
+            converge,
+            daemon: as_daemon,
+        } => match (target, converge.relay.is_some()) {
+            (Some(target), false) => {
+                let report = pear_core::sync::sync_cycle(&source, &target)?;
+                print_report(&report);
+            }
+            (None, true) => {
+                if as_daemon {
+                    register_converge(&source, &converge)?;
+                } else {
+                    converge_foreground(&source, &converge)?;
+                }
+            }
+            (Some(_), true) => {
+                bail!("`pear sync` takes either a TARGET (one local cycle) or --relay (the converge loop), not both")
+            }
+            (None, false) => {
+                bail!("`pear sync` needs a TARGET for a local cycle, or --relay <url> for the converge loop")
+            }
+        },
+        Commands::Join { path, converge } => join(&path, &converge)?,
         Commands::Watch {
             source,
             target,
-            relay,
-            token,
-            device,
-            force,
-            team,
-            e2e,
             daemon: as_daemon,
-            tls,
-        } => match (target, relay) {
-            (Some(target), None) => {
-                if as_daemon {
-                    register_watch(
-                        &source,
-                        Some(&target),
-                        None,
-                        token,
-                        device,
-                        force,
-                        team,
-                        e2e,
-                        &tls,
-                    )?;
-                } else {
-                    println!(
-                        "watching {} -> {} (ctrl-c to stop)",
-                        source.display(),
-                        target.display()
-                    );
-                    loops::watch_local(&source, &target, &LoopControl::foreground(), print_report)?;
-                }
+        } => {
+            if as_daemon {
+                register_watch(&source, &target)?;
+            } else {
+                println!(
+                    "watching {} -> {} (ctrl-c to stop)",
+                    source.display(),
+                    target.display()
+                );
+                loops::watch_local(&source, &target, &LoopControl::foreground(), print_report)?;
             }
-            (None, Some(relay)) => {
-                if as_daemon {
-                    register_watch(
-                        &source,
-                        None,
-                        Some(relay),
-                        token,
-                        device,
-                        force,
-                        team,
-                        e2e,
-                        &tls,
-                    )?;
-                } else {
-                    watch_writer(&source, &relay, token, device, force, team, e2e, &tls)?;
-                }
-            }
-            (Some(_), Some(_)) => {
-                bail!("`pear watch` takes either a TARGET (local sync) or --relay (writer mode), not both")
-            }
-            (None, None) => {
-                bail!(
-                    "`pear watch` needs a TARGET for local sync, or --relay <url> for writer mode"
-                )
-            }
-        },
+        }
         Commands::Mirror {
             path,
             workspace,
@@ -600,14 +597,6 @@ fn main() -> Result<()> {
         Commands::Daemon { command } => match command {
             DaemonCommand::Stop => daemon_stop()?,
         },
-        Commands::Checkout {
-            path,
-            relay,
-            token,
-            device,
-            force,
-            tls,
-        } => checkout(&path, &relay, token, device, force, &tls)?,
         Commands::Snapshot {
             path,
             message,
@@ -633,6 +622,19 @@ fn main() -> Result<()> {
         } => clone(&path, &workspace, snapshot, &relay, token, name, &tls)?,
     }
     Ok(())
+}
+
+impl ConvergeArgs {
+    /// The relay URL and the resolved bearer token. `--relay` is what
+    /// switches `sync` into converge mode, so every caller that gets here
+    /// has one; a missing token fails before anything touches the network.
+    fn relay_and_token(&self) -> Result<(&str, String)> {
+        let relay = self
+            .relay
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--relay <url> is required"))?;
+        Ok((relay, resolve_token(self.token.clone())?))
+    }
 }
 
 impl RelayTls {
@@ -863,7 +865,7 @@ fn team_add(
 /// the user was a member, so the removed/was-not-a-member line comes
 /// from a membership read just before the delete. The departed member's
 /// wrapped workspace keys die with the membership (their `keys/me` 404s
-/// at once); the crypto cutoff is the writer's next watch-start pass.
+/// at once); the crypto cutoff is a writer's next converge-start pass.
 fn team_remove(
     team: &str,
     user: &str,
@@ -904,11 +906,23 @@ fn team_members(team: &str, relay: &str, token: Option<String>, tls: &RelayTls) 
 
 /// `pear rekey` (§20): force one keyring rotation and re-wrap for the
 /// current team — the operator's compromise response. No push is needed:
-/// the writer's next push encrypts under the newest generation
+/// the next converge encrypts under the newest generation
 /// automatically, and unchanged content keeps its ciphertext. Errors when
 /// the workspace is not e2e (nothing to rotate) or has no attached team
 /// (nobody to re-wrap for; rotating would only orphan readers).
-fn rekey(path: &Path, relay: &str, token: Option<String>, tls: &RelayTls) -> Result<()> {
+///
+/// §32: the rotation merges the relay's copy of `name`'s wrapped keyring
+/// in first, so a rekey on one device extends the ring another device may
+/// already have rotated instead of forking its generation number. Without
+/// `--name` there is no identity to unwrap that copy with and the local
+/// ring rotates alone (the pass says so).
+fn rekey(
+    path: &Path,
+    relay: &str,
+    token: Option<String>,
+    name: Option<&str>,
+    tls: &RelayTls,
+) -> Result<()> {
     let token = resolve_token(token)?;
     let Some(meta) = pear_core::load_workspace(path)? else {
         bail!(
@@ -936,17 +950,25 @@ fn rekey(path: &Path, relay: &str, token: Option<String>, tls: &RelayTls) -> Res
             meta.id
         );
     }
-    // Only the writer holds the keyring — refuse to invent one here (a
+    // Only a converging writer holds the keyring — refuse to invent one
+    // here (a
     // fresh key could never decrypt the existing head).
     let mut keyring = pear_core::e2e::load_workspace_keyring(path)?.ok_or_else(|| {
         anyhow::anyhow!(
             "workspace {} is end-to-end encrypted but this device has no workspace key; \
-             run `pear watch --relay --e2e` on the writer first",
+             run `pear join --relay <url> --e2e` on a writer first",
             meta.id
         )
     })?;
-    let rotation =
-        pear_core::e2e::rotation_maintenance(&client, path, &mut keyring, &known_keys_path()?, true)?;
+    let rotation = pear_core::e2e::rotation_maintenance(
+        &client,
+        path,
+        &mut keyring,
+        &known_keys_path()?,
+        &keys_dir()?,
+        name,
+        true,
+    )?;
     print_rotation_report(&rotation);
     println!(
         "workspace keyring is now at generation {}; the next push encrypts under it",
@@ -986,7 +1008,7 @@ fn share(
     // Register idempotently so sharing works before the first watch too.
     // An existing workspace keeps its registered flavor (the e2e flag is
     // immutable relay-side); only a fresh one is created here — plain,
-    // since an e2e workspace only ever exists after `watch --e2e`.
+    // since an e2e workspace only ever exists after `join --e2e`.
     let e2e = match client.get_workspace() {
         Ok(ws) => ws.e2e,
         Err(RelayError::NotFound(_)) => {
@@ -1002,14 +1024,14 @@ fn share(
         workspace_name(path)
     );
     if e2e {
-        // §17 wrap-maintenance after share. Only the writer holds the
+        // §17 wrap-maintenance after share. Only a converging writer holds the
         // workspace keyring — refuse to invent one here (a fresh key could
         // never decrypt the existing head). §20: wrapping never rotates;
         // new members receive the full keyring, history included.
         let keyring = pear_core::e2e::load_workspace_keyring(path)?.ok_or_else(|| {
             anyhow::anyhow!(
                 "workspace {} is end-to-end encrypted but this device has no workspace key; \
-                 run `pear watch --relay --e2e` on the writer first",
+                 run `pear join --relay <url> --e2e` on a writer first",
                 meta.id
             )
         })?;
@@ -1024,34 +1046,82 @@ fn known_keys_path() -> Result<PathBuf> {
     Ok(daemon::pear_home()?.join("known_keys"))
 }
 
-/// Writer flow (§11): the shared loop body in `loops` with foreground
-/// control (fatal fencing exits with EXIT_LOST_LEASE, as before).
-/// `--e2e` registers and pushes the workspace end-to-end encrypted (§17).
-#[allow(clippy::too_many_arguments)]
-fn watch_writer(
-    source: &Path,
-    relay: &str,
-    token: Option<String>,
-    device: Option<String>,
-    force: bool,
-    team: Option<String>,
-    e2e: bool,
-    tls: &RelayTls,
-) -> Result<()> {
-    let token = resolve_token(token)?;
-    loops::watch_writer(
+/// `pear sync --relay` (§32): the converge loop in the foreground, with
+/// foreground control (a fatal condition prints and exits). This is the
+/// same loop body `peard` runs for a joined workspace — it exists for
+/// debugging and CI, not for daily use.
+fn converge_foreground(source: &Path, args: &ConvergeArgs) -> Result<()> {
+    let (relay, token) = args.relay_and_token()?;
+    loops::converge(
         source,
         relay,
         &token,
-        device,
-        force,
-        team,
-        e2e,
-        tls.tls_ca_cert.as_deref(),
+        args.workspace.as_deref(),
+        args.device.clone(),
+        args.team.clone(),
+        args.e2e,
+        args.name.as_deref(),
+        args.tls.tls_ca_cert.as_deref(),
         &LoopControl::foreground(),
-        print_push_report,
+        print_converge_report,
     )
 }
+
+/// `pear join` (§32): the one-time front door. Register the converge loop
+/// with peard — starting peard first if its socket is not answering — and
+/// return. Nothing else is ever needed for this workspace.
+fn join(path: &Path, args: &ConvergeArgs) -> Result<()> {
+    let (_, token) = args.relay_and_token()?;
+    let home = daemon::pear_home()?;
+    ensure_peard(&home, &token)?;
+    register_converge(path, args)
+}
+
+/// Start `peard` detached if nothing is listening on its socket (§32:
+/// `join` auto-starts the daemon). The token goes in the CHILD's
+/// environment, never on its command line or into `daemon.json` — peard
+/// reads `PEAR_TOKEN` to resume relay workspaces after a restart, and a
+/// token on argv would be world-readable in `ps`.
+fn ensure_peard(home: &Path, token: &str) -> Result<()> {
+    if daemon::send(home, &daemon::Request::List).is_ok() {
+        return Ok(());
+    }
+    // Next to us first (a git checkout, a tarball install), then PATH.
+    let peard = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("peard")))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from("peard"));
+    std::process::Command::new(&peard)
+        .env("PEAR_TOKEN", token)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "start the pear daemon ({}) — start it yourself and re-run join",
+                peard.display()
+            )
+        })?;
+    // The socket appears within milliseconds; wait for it rather than
+    // racing the registration that follows.
+    for _ in 0..PEARD_START_TRIES {
+        std::thread::sleep(PEARD_START_POLL);
+        if daemon::send(home, &daemon::Request::List).is_ok() {
+            println!("started peard ({})", daemon::socket_path(home).display());
+            return Ok(());
+        }
+    }
+    bail!(
+        "peard did not come up on {} — start it in a terminal to see why",
+        daemon::socket_path(home).display()
+    )
+}
+
+/// How long `join` waits for a freshly spawned peard's socket.
+const PEARD_START_TRIES: u32 = 100;
+const PEARD_START_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Mirror flow (§11/§14): the shared loop body in `loops` with foreground
 /// control. On an e2e workspace, `name` selects the local keypair that
@@ -1077,54 +1147,56 @@ fn mirror(
     )
 }
 
-/// `pear watch --daemon` (§16): register the watch with the running daemon
-/// instead of running the loop here. The daemon holds the token in memory
-/// only; it is resolved here so a missing token fails before the socket
-/// round-trip. Fails cleanly when no daemon is up — never spawns one.
-/// The §17 CA path is absolutized (peard's CWD is not ours) and validated
-/// here, so an unreadable file fails at registration.
-#[allow(clippy::too_many_arguments)]
-fn register_watch(
-    source: &Path,
-    target: Option<&Path>,
-    relay: Option<String>,
-    token: Option<String>,
-    device: Option<String>,
-    force: bool,
-    team: Option<String>,
-    e2e: bool,
-    tls: &RelayTls,
-) -> Result<()> {
+/// `pear watch --daemon` (§16): register the LOCAL two-directory watch
+/// with the running daemon instead of running the loop here. Fails cleanly
+/// when no daemon is up — never spawns one (only `join` does that).
+fn register_watch(source: &Path, target: &Path) -> Result<()> {
     let source = source
         .canonicalize()
         .with_context(|| format!("canonicalize {}", source.display()))?;
-    let target = match target {
-        Some(t) => {
-            Some(std::path::absolute(t).with_context(|| format!("absolutize {}", t.display()))?)
-        }
-        None => None,
-    };
-    let token = match relay.is_some() {
-        true => Some(resolve_token(token)?),
-        false => None,
-    };
-    let tls_ca_cert = tls.absolutized_ca()?;
+    let target = std::path::absolute(target)
+        .with_context(|| format!("absolutize {}", target.display()))?;
     let request = daemon::Request::AddWatch {
         path: source,
         target,
-        relay,
-        token,
-        device,
-        force,
-        team,
-        e2e,
-        tls_ca_cert,
     };
     let result = daemon::send(&daemon::pear_home()?, &request)?.into_result()?;
     println!(
         "registered with peard: {}",
         daemon::EntryInfo::from_json(&result)?.summary()
     );
+    Ok(())
+}
+
+/// Register a §32 converge loop with peard (`pear join`, and
+/// `pear sync --relay --daemon`). The daemon holds the token in memory
+/// only; it is resolved here so a missing token fails before the socket
+/// round-trip. The §17 CA path is absolutized (peard's CWD is not ours)
+/// and validated here, so an unreadable file fails at registration.
+fn register_converge(path: &Path, args: &ConvergeArgs) -> Result<()> {
+    let (relay, token) = args.relay_and_token()?;
+    // The path may not exist yet (`join` into a fresh directory).
+    std::fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", path.display()))?;
+    let request = daemon::Request::AddConverge {
+        path,
+        relay: relay.to_string(),
+        token,
+        workspace: args.workspace.clone(),
+        device: args.device.clone(),
+        team: args.team.clone(),
+        e2e: args.e2e,
+        name: args.name.clone(),
+        tls_ca_cert: args.tls.absolutized_ca()?,
+    };
+    let result = daemon::send(&daemon::pear_home()?, &request)?.into_result()?;
+    println!(
+        "registered with peard: {}",
+        daemon::EntryInfo::from_json(&result)?.summary()
+    );
+    println!("nothing else to run — this workspace now converges on its own");
     Ok(())
 }
 
@@ -1158,7 +1230,8 @@ fn register_mirror(
 }
 
 /// `pear status` (§16): per-workspace state from the daemon — role
-/// (watch/mirror), relay, head seq, and the last error if a loop failed.
+/// (`sync` = the §32 converge loop, `watch` = local, `mirror` =
+/// read-only), relay, head seq, and the last error if a loop failed.
 fn status(path: Option<PathBuf>) -> Result<()> {
     let path = path.map(|p| {
         p.canonicalize()
@@ -1198,53 +1271,8 @@ fn daemon_stop() -> Result<()> {
     Ok(())
 }
 
-/// Handoff (§5/§11): transfer the lease to this device — or force-take it,
-/// fencing the current writer — and print the new generation.
-fn checkout(
-    path: &Path,
-    relay: &str,
-    token: Option<String>,
-    device: Option<String>,
-    force: bool,
-    tls: &RelayTls,
-) -> Result<()> {
-    let token = resolve_token(token)?;
-    let device = device.unwrap_or_else(hostname);
-    // Checkout must target an existing workspace — minting a fresh id here
-    // would just 404 against the relay and strand a stray `.pear`.
-    let Some(meta) = pear_core::load_workspace(path)? else {
-        bail!(
-            "{} is not a pear workspace; run `pear mirror --workspace <id> --relay <url>` first",
-            path.display()
-        );
-    };
-    let client =
-        RelayClient::with_tls_ca(relay, &token, &meta.id, &device, tls.ca_pem()?.as_deref())?;
-    let generation = if force {
-        client.force()?
-    } else {
-        // The synced-to-head proof is what THIS device has applied locally
-        // (`.pear/remote.json`), not the relay's own head — sending the
-        // relay's seq would make the transfer check a tautology and let a
-        // stale tree overwrite the writer's newer commits.
-        let applied = pear_core::sync::last_applied_seq(path).unwrap_or(0);
-        client.transfer(applied).map_err(|e| match e {
-            e @ RelayError::TransferRejected { .. } => anyhow::anyhow!(
-                "{e}. Run `pear mirror` to reach the current head first \
-                 (or --force, which can strand the writer's unsynced changes)"
-            ),
-            other => anyhow::Error::new(other),
-        })?
-    };
-    println!(
-        "lease held by {device}: workspace {}, generation {generation}",
-        meta.id
-    );
-    Ok(())
-}
-
 /// `pear snapshot` (§12): preserve the local tree as a named snapshot on
-/// the relay. Works head-synced or not — the writer pipeline minus the
+/// the relay. Works head-synced or not — the push pipeline minus the
 /// head commit.
 fn snapshot(
     path: &Path,
@@ -1278,11 +1306,11 @@ fn snapshot(
     };
     let report = if e2e {
         // §17: the snapshot commits the encrypted manifest. Only the
-        // writer holds the workspace keyring — never invent one here.
+        // converging writer holds the workspace keyring — never invent one here.
         let keyring = pear_core::e2e::load_workspace_keyring(path)?.ok_or_else(|| {
             anyhow::anyhow!(
                 "workspace {} is end-to-end encrypted but this device has no workspace key; \
-                 run `pear watch --relay --e2e` on the writer first",
+                 run `pear join --relay <url> --e2e` on a writer first",
                 meta.id
             )
         })?;
@@ -1502,26 +1530,45 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    /// Writer-mode flags must not be silently accepted in local mode: a
-    /// no-op `--force` would let a user believe a takeover happened.
+    /// §32: `pear watch` is LOCAL ONLY — the relay writer mode and every
+    /// lease flag are gone, and the relay surface lives on `join`/`sync`.
     #[test]
-    fn watch_rejects_writer_flags_without_relay() {
+    fn watch_is_local_only_and_converge_flags_need_a_relay() {
+        assert!(Cli::try_parse_from(["pear", "watch", "a", "b"]).is_ok());
+        assert!(Cli::try_parse_from(["pear", "watch", "a", "b", "--daemon"]).is_ok());
         for args in [
+            vec!["pear", "watch", "a"],
+            vec!["pear", "watch", "a", "--relay", "http://x"],
             vec!["pear", "watch", "a", "b", "--force"],
-            vec!["pear", "watch", "a", "b", "--device", "x"],
-            vec!["pear", "watch", "a", "b", "--team", "t"],
-            vec!["pear", "watch", "a", "b", "--token", "t"],
             vec!["pear", "watch", "a", "b", "--e2e"],
+            vec!["pear", "checkout", "a", "--relay", "http://x"],
         ] {
             assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
         }
-        assert!(
-            Cli::try_parse_from(["pear", "watch", "a", "--relay", "http://x", "--force"]).is_ok()
-        );
-        assert!(
-            Cli::try_parse_from(["pear", "watch", "a", "--relay", "http://x", "--e2e"]).is_ok()
-        );
-        assert!(Cli::try_parse_from(["pear", "watch", "a", "b"]).is_ok());
+
+        // `sync` keeps both shapes: one local cycle, or the converge loop.
+        assert!(Cli::try_parse_from(["pear", "sync", "a", "b"]).is_ok());
+        assert!(Cli::try_parse_from(["pear", "sync", "a", "--relay", "http://x"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "pear", "sync", "a", "--relay", "http://x", "--daemon"
+        ])
+        .is_ok());
+        // Converge flags require --relay on both surfaces.
+        for args in [
+            vec!["pear", "sync", "a", "b", "--e2e"],
+            vec!["pear", "sync", "a", "b", "--workspace", "w"],
+            vec!["pear", "sync", "a", "b", "--daemon"],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
+        }
+
+        // §32's front door and its full flag set.
+        assert!(Cli::try_parse_from(["pear", "join", "a", "--relay", "http://x"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "pear", "join", "a", "--relay", "http://x", "--workspace", "w", "--team", "t",
+            "--e2e", "--token", "tok", "--device", "d", "--name", "jane",
+        ])
+        .is_ok());
     }
 
     /// §17 surfaces: keygen requires --name (there is no local user
@@ -1589,7 +1636,7 @@ mod tests {
         assert!(Cli::try_parse_from(["pear", "team", "remove", "t", "--relay", "http://x"]).is_err());
         assert!(Cli::try_parse_from(["pear", "team", "remove", "t", "--user", "u"]).is_err());
         assert!(Cli::try_parse_from([
-            "pear", "watch", "a", "--relay", "http://x", "--e2e", "--daemon"
+            "pear", "join", "a", "--relay", "http://x", "--e2e"
         ])
         .is_ok());
         assert!(Cli::try_parse_from([
@@ -1612,7 +1659,7 @@ mod tests {
     fn daemon_surface_parses() {
         assert!(Cli::try_parse_from(["pear", "watch", "a", "b", "--daemon"]).is_ok());
         assert!(
-            Cli::try_parse_from(["pear", "watch", "a", "--relay", "http://x", "--daemon"]).is_ok()
+            Cli::try_parse_from(["pear", "sync", "a", "--relay", "http://x", "--daemon"]).is_ok()
         );
         assert!(Cli::try_parse_from([
             "pear",
@@ -1681,7 +1728,8 @@ mod tests {
             ],
             vec!["pear", "share", "p", "--team", "t", "--relay", "http://x"],
             vec!["pear", "rekey", "p", "--relay", "http://x"],
-            vec!["pear", "watch", "a", "--relay", "http://x"],
+            vec!["pear", "join", "a", "--relay", "http://x"],
+            vec!["pear", "sync", "a", "--relay", "http://x"],
             vec![
                 "pear",
                 "mirror",
@@ -1691,7 +1739,6 @@ mod tests {
                 "--relay",
                 "http://x",
             ],
-            vec!["pear", "checkout", "p", "--relay", "http://x"],
             vec!["pear", "snapshot", "p", "--relay", "http://x"],
             vec!["pear", "snapshots", "p", "--relay", "http://x"],
             vec![
@@ -1739,7 +1786,7 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             tokio::spawn(async move {
-                pear_relay::serve_on(listener, TOKEN, &relay_dir, 300)
+                pear_relay::serve_on(listener, TOKEN, &relay_dir)
                     .await
                     .expect("relay serve failed");
             });
@@ -1779,26 +1826,33 @@ mod tests {
             .unwrap();
 
         // The e2e workspace: pushed once at generation 1, wrapped to
-        // alice+bob, record persisted — what `pear watch --e2e` sets up.
+        // alice+bob, record persisted — what `pear join --e2e` sets up.
         let dir_a = tmp.path().join("a");
         std::fs::create_dir_all(&dir_a).unwrap();
         std::fs::write(dir_a.join("f.txt"), b"v1\n").unwrap();
         let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
         let alice = RelayClient::new(&url, &alice_tok, &meta.id, "alice-laptop");
         alice.create_workspace_e2e("api", Some(&team.id)).unwrap();
-        alice.acquire().unwrap();
         let mut keyring = pear_core::e2e::load_or_create_workspace_keyring(&dir_a).unwrap();
         pear_core::sync::push_cycle_e2e(&dir_a, &alice, 0, false, &keyring).unwrap();
         let known_keys = pear_home.join("known_keys");
-        pear_core::e2e::rotation_maintenance(&alice, &dir_a, &mut keyring, &known_keys, false)
-            .unwrap();
+        pear_core::e2e::rotation_maintenance(
+            &alice,
+            &dir_a,
+            &mut keyring,
+            &known_keys,
+            &keys_dir,
+            Some("alice"),
+            false,
+        )
+        .unwrap();
         assert_eq!(keyring.newest().0, 1, "setup: still generation 1");
 
         // Happy path: one forced rotation, gen 1 -> 2, team re-wrapped,
         // record updated. (The test's `keyring` var still holds gen 1:
         // `rekey` loads and rotates its own copy from disk.)
         let tls = RelayTls { tls_ca_cert: None };
-        rekey(&dir_a, &url, Some(alice_tok.clone()), &tls).unwrap();
+        rekey(&dir_a, &url, Some(alice_tok.clone()), Some("alice"), &tls).unwrap();
         let reloaded = pear_core::e2e::load_workspace_keyring(&dir_a)
             .unwrap()
             .unwrap();
@@ -1834,7 +1888,7 @@ mod tests {
         RelayClient::new(&url, &alice_tok, &pmeta.id, "alice-laptop")
             .create_workspace("plain")
             .unwrap();
-        let err = rekey(&dir_p, &url, Some(alice_tok.clone()), &tls).unwrap_err();
+        let err = rekey(&dir_p, &url, Some(alice_tok.clone()), Some("alice"), &tls).unwrap_err();
         assert!(
             format!("{err:#}").contains("not end-to-end encrypted"),
             "{err:#}"
@@ -1847,7 +1901,7 @@ mod tests {
         RelayClient::new(&url, &alice_tok, &smeta.id, "alice-laptop")
             .create_workspace_e2e("solo", None)
             .unwrap();
-        let err = rekey(&dir_s, &url, Some(alice_tok), &tls).unwrap_err();
+        let err = rekey(&dir_s, &url, Some(alice_tok), Some("alice"), &tls).unwrap_err();
         assert!(format!("{err:#}").contains("no attached team"), "{err:#}");
     }
 
@@ -1870,7 +1924,7 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             tokio::spawn(async move {
-                pear_relay::serve_on(listener, TOKEN, &relay_dir, 300)
+                pear_relay::serve_on(listener, TOKEN, &relay_dir)
                     .await
                     .expect("relay serve failed");
             });

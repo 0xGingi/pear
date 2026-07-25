@@ -1,8 +1,8 @@
 //! pear relay server (DESIGN.md §11): bearer-token auth, the workspace
-//! registry, a global content-addressed chunk pool, the head log with CAS,
-//! the single-writer lease state machine (acquire / heartbeat / transfer /
-//! force, TTL expiry, generation fencing on head writes), and the §14
-//! WebSocket fan-out of `head_changed` hints to mirrors.
+//! registry, a global content-addressed chunk pool, the head log with CAS
+//! (§32: that CAS is the whole of concurrency control — leases are
+//! retired), and the §14 WebSocket fan-out of `head_changed` hints to
+//! mirrors and converging writers.
 //!
 //! §17: with `--tls-cert`/`--tls-key` the same API is served over HTTPS
 //! directly (rustls, no proxy); absent those flags plain HTTP is unchanged.
@@ -54,22 +54,20 @@ const POOL_GC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(360
 /// earned only at commit).
 const POOL_GC_GRACE: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// Shared relay state: the metadata DB, the global chunk pool, the lease
-/// TTL that drives expiry and fencing, and the per-workspace fan-out
-/// channels for `head_changed` hints (§14).
+/// Shared relay state: the metadata DB, the global chunk pool, and the
+/// per-workspace fan-out channels for `head_changed` hints (§14).
 #[derive(Clone)]
 pub(crate) struct AppState {
     token: Arc<str>,
     db: Arc<Mutex<db::Db>>,
     store: Arc<LocalStore>,
-    lease_ttl_secs: i64,
     broadcasts: Arc<Mutex<HashMap<String, broadcast::Sender<String>>>>,
     /// Seconds between reader-role re-checks on live WS connections.
     ws_recheck_secs: u64,
 }
 
 impl AppState {
-    fn new(token: &str, data_dir: &Path, lease_ttl_secs: u64) -> anyhow::Result<Self> {
+    fn new(token: &str, data_dir: &Path) -> anyhow::Result<Self> {
         if token.is_empty() {
             anyhow::bail!(
                 "relay token is empty: the relay would accept an empty bearer credential — set a non-empty token"
@@ -92,7 +90,6 @@ impl AppState {
             token,
             db: Arc::new(Mutex::new(db)),
             store: Arc::new(store),
-            lease_ttl_secs: lease_ttl_secs as i64,
             broadcasts: Arc::new(Mutex::new(HashMap::new())),
             ws_recheck_secs: 60,
         })
@@ -166,9 +163,8 @@ pub async fn serve(
     addr: std::net::SocketAddr,
     token: &str,
     data_dir: &std::path::Path,
-    lease_ttl_secs: u64,
 ) -> anyhow::Result<()> {
-    let state = AppState::new(token, data_dir, lease_ttl_secs)?;
+    let state = AppState::new(token, data_dir)?;
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
@@ -274,9 +270,8 @@ pub async fn serve_on(
     listener: TcpListener,
     token: &str,
     data_dir: &Path,
-    lease_ttl_secs: u64,
 ) -> anyhow::Result<()> {
-    let state = AppState::new(token, data_dir, lease_ttl_secs)?;
+    let state = AppState::new(token, data_dir)?;
     serve_listener(listener, state).await
 }
 
@@ -320,10 +315,9 @@ pub async fn serve_tls(
     addr: std::net::SocketAddr,
     token: &str,
     data_dir: &Path,
-    lease_ttl_secs: u64,
     tls: ServerTls,
 ) -> anyhow::Result<()> {
-    let state = AppState::new(token, data_dir, lease_ttl_secs)?;
+    let state = AppState::new(token, data_dir)?;
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
@@ -336,10 +330,9 @@ pub async fn serve_on_tls(
     listener: TcpListener,
     token: &str,
     data_dir: &Path,
-    lease_ttl_secs: u64,
     tls: ServerTls,
 ) -> anyhow::Result<()> {
-    let state = AppState::new(token, data_dir, lease_ttl_secs)?;
+    let state = AppState::new(token, data_dir)?;
     serve_listener_tls(listener, state, &tls).await
 }
 

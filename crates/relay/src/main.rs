@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 /// pear relay server: bearer-token auth, workspace registry, global chunk
-/// pool, head log, and single-writer lease coordination.
+/// pool, and the head log with CAS (§32: multi-writer, no leases).
 #[derive(Parser)]
 #[command(name = "pear-relay", version, about)]
 struct Args {
@@ -21,10 +21,6 @@ struct Args {
     /// Data directory for the chunk pool and metadata database.
     #[arg(long, default_value = "./.pear-relay")]
     data_dir: PathBuf,
-
-    /// Lease TTL in seconds; writers must heartbeat within this window.
-    #[arg(long, default_value_t = 300)]
-    lease_ttl_secs: u64,
 
     /// Serve HTTPS with this PEM certificate chain instead of plain HTTP
     /// (§17); requires --tls-key.
@@ -47,17 +43,8 @@ async fn main() -> anyhow::Result<()> {
     };
     match tls {
         Some(tls) => {
-            pear_relay::serve_tls(
-                args.addr,
-                &args.token,
-                &args.data_dir,
-                args.lease_ttl_secs,
-                tls,
-            )
-            .await
+            pear_relay::serve_tls(args.addr, &args.token, &args.data_dir, tls).await
         }
-        None => {
-            pear_relay::serve(args.addr, &args.token, &args.data_dir, args.lease_ttl_secs).await
-        }
+        None => pear_relay::serve(args.addr, &args.token, &args.data_dir).await,
     }
 }

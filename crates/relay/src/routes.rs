@@ -80,10 +80,6 @@ pub(crate) fn router(state: AppState) -> Router {
             post(create_snapshot).get(list_snapshots),
         )
         .route("/v1/workspaces/{id}/snapshots/{sid}", get(get_snapshot))
-        .route("/v1/workspaces/{id}/lease/acquire", post(lease_acquire))
-        .route("/v1/workspaces/{id}/lease/heartbeat", post(lease_heartbeat))
-        .route("/v1/workspaces/{id}/lease/transfer", post(lease_transfer))
-        .route("/v1/workspaces/{id}/lease/force", post(lease_force))
         .route("/v1/ws", get(ws_subscribe))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
@@ -201,7 +197,7 @@ where
     }
 }
 
-/// Current unix time in whole seconds (lease expiry granularity).
+/// Current unix time in whole seconds (row timestamp granularity).
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -335,8 +331,9 @@ fn valid_name(s: &str) -> bool {
         && !s.contains('/')
 }
 
-/// Device ids are persisted on lease/snapshot rows and echoed back
-/// verbatim: bound them like every other stored string.
+/// Device ids are persisted on snapshot rows (and carried on head
+/// commits for attribution) and echoed back verbatim: bound them like
+/// every other stored string.
 fn check_device(device: &str) -> Result<(), ApiError> {
     if !valid_name(device) {
         return Err(ApiError::BadRequest(format!(
@@ -1008,13 +1005,6 @@ async fn create_workspace(
 }
 
 #[derive(Serialize)]
-struct LeaseInfo {
-    holder: String,
-    generation: i64,
-    expires_at: i64,
-}
-
-#[derive(Serialize)]
 struct WorkspaceResponse {
     id: String,
     name: String,
@@ -1024,7 +1014,6 @@ struct WorkspaceResponse {
     e2e: bool,
     head_seq: Option<i64>,
     head_hash: Option<String>,
-    lease: Option<LeaseInfo>,
 }
 
 /// The §11 workspace read shape (plus the §13 owner/team fields and the §17
@@ -1035,7 +1024,6 @@ fn workspace_response(
     ws: &crate::db::Workspace,
 ) -> Result<Json<WorkspaceResponse>, ApiError> {
     let head = db.current_head(&ws.id)?;
-    let lease = db.get_lease(&ws.id)?;
     Ok(Json(WorkspaceResponse {
         id: ws.id.clone(),
         name: ws.name.clone(),
@@ -1044,11 +1032,6 @@ fn workspace_response(
         e2e: ws.e2e,
         head_seq: head.as_ref().map(|h| h.seq),
         head_hash: head.map(|h| h.hash),
-        lease: lease.map(|l| LeaseInfo {
-            holder: l.holder,
-            generation: l.generation,
-            expires_at: l.expires_at,
-        }),
     }))
 }
 
@@ -1320,9 +1303,10 @@ async fn chunks_missing(
     JsonBody(req): JsonBody<MissingRequest>,
 ) -> Result<Json<MissingResponse>, ApiError> {
     // Bound the batch: every hash costs a visibility query under the one
-    // global DB mutex, so one request must not stall every route (a
-    // spuriously fenced writer's heartbeat is time-sensitive). The
-    // client splits larger lists transparently (`MISSING_BATCH`).
+    // global DB mutex, so one request must not stall every route (§32:
+    // every writer converges concurrently, so no single request may
+    // monopolize it). The client splits larger lists transparently
+    // (`MISSING_BATCH`).
     const MAX_MISSING_BATCH: usize = 50_000;
     if req.hashes.len() > MAX_MISSING_BATCH {
         return Err(ApiError::BadRequest(format!(
@@ -1535,7 +1519,7 @@ async fn get_many_chunks(
     .await
 }
 
-// --- head log (CAS, generation fencing) ------------------------------------
+// --- head log (CAS; §32: the CAS is the only concurrency control) ---------
 
 async fn get_head(
     Extension(principal): Extension<Principal>,
@@ -1621,33 +1605,13 @@ async fn put_head(
             let db = lock_db(&state)?;
             let ws = require_role(&db, &id, &principal, Role::Writer)?;
 
-            // Fencing first (headers only): only the current lease holder,
-            // presenting the current generation of an unexpired lease, may move
-            // the head — regardless of what the manifest contains.
+            // §32: no leases, no fencing — the CAS below is the ONLY
+            // concurrency control. The device header stays: it is required
+            // for attribution (and validated the same way snapshots
+            // validate theirs), never for authorization.
             let device = header_str(&headers, "x-pear-device")
                 .ok_or_else(|| ApiError::Forbidden("missing X-Pear-Device header".to_string()))?;
             check_device(device)?;
-            let generation: i64 = header_str(&headers, "x-pear-generation")
-                .and_then(|v| v.parse().ok())
-                .ok_or_else(|| {
-                    ApiError::Forbidden("missing or invalid X-Pear-Generation header".to_string())
-                })?;
-            let now = unix_now();
-            let fenced = match db.get_lease(&id)? {
-                Some(lease) => {
-                    lease.holder != device
-                        || lease.generation != generation
-                        || now >= lease.expires_at
-                }
-                None => true,
-            };
-            if fenced {
-                return Err(ApiError::Fenced(
-                    "head write fenced: lease missing, held by another device, \
-                     stale generation, or expired"
-                        .to_string(),
-                ));
-            }
 
             // §17: the manifest flavor is pinned by the workspace's immutable
             // e2e flag — a plaintext manifest on an e2e workspace (or
@@ -1733,8 +1697,8 @@ async fn put_head(
 
 /// The manifest trust boundary shared by `PUT /head` and snapshot create
 /// (§12): parse, path safety, workspace-id match, chunk-hash format, and
-/// chunk presence in the pool *visible to this caller* (§13). Fencing and
-/// CAS are head-only concerns and stay in `put_head`. Manifests arrive
+/// chunk presence in the pool *visible to this caller* (§13). The CAS is
+/// a head-only concern and stays in `put_head`. Manifests arrive
 /// over the network and are never trusted blindly. Returns the parsed
 /// manifest on success.
 fn validate_submitted_manifest(
@@ -1867,8 +1831,7 @@ struct E2eStoredManifest {
 
 /// Store-side encode of the §24 e2e envelope. The hashes are
 /// canonicalized (sorted, deduped) so byte-identical state stores
-/// byte-identical text — `lease_force`'s checkpoint dedup compares
-/// stored text.
+/// byte-identical text — snapshot dedup compares stored text.
 pub(crate) fn e2e_stored_manifest(manifest_enc: &str, chunk_hashes: &[String]) -> String {
     let chunk_hashes: std::collections::BTreeSet<&String> = chunk_hashes.iter().collect();
     serde_json::to_string(&E2eStoredManifest {
@@ -2003,10 +1966,11 @@ struct SnapshotCreateResponse {
 }
 
 /// Store an immutable snapshot: the same manifest trust boundary as
-/// `PUT /head`, minus fencing/CAS — a snapshot moves nothing, so it needs
-/// no lease. CLI-made snapshots are `kind: "named"`; the relay itself only
-/// makes `checkpoint` snapshots (on lease force). On an e2e workspace the
-/// body is `manifest_enc` + `chunk_hashes`, exactly like the head (§17).
+/// `PUT /head`, minus the CAS — a snapshot moves nothing. Snapshots are
+/// `kind: "named"` (§32 retired the relay-made `checkpoint` snapshots
+/// that lease force used to write; the column keeps the value for rows
+/// written by older relays). On an e2e workspace the body is
+/// `manifest_enc` + `chunk_hashes`, exactly like the head (§17).
 async fn create_snapshot(
     Extension(principal): Extension<Principal>,
     State(state): State<AppState>,
@@ -2182,250 +2146,6 @@ async fn get_snapshot(
             manifest,
             manifest_enc,
         }))
-    })
-    .await
-}
-
-// --- lease state machine ----------------------------------------------------
-
-#[derive(Deserialize)]
-struct AcquireRequest {
-    device_id: String,
-}
-
-#[derive(Serialize)]
-struct AcquireResponse {
-    generation: i64,
-    expires_at: i64,
-}
-
-async fn lease_acquire(
-    Extension(principal): Extension<Principal>,
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    JsonBody(req): JsonBody<AcquireRequest>,
-) -> Result<Json<AcquireResponse>, ApiError> {
-    block(move || {
-        let db = lock_db(&state)?;
-        require_role(&db, &id, &principal, Role::Writer)?;
-        check_device(&req.device_id)?;
-        let now = unix_now();
-        let expires_at = now + state.lease_ttl_secs;
-        match db.get_lease(&id)? {
-            // No lease: grant at generation 1.
-            None => {
-                db.put_lease(&id, &req.device_id, 1, expires_at)?;
-                Ok(Json(AcquireResponse {
-                    generation: 1,
-                    expires_at,
-                }))
-            }
-            // Expired lease: steal succeeds and the generation bump fences the
-            // previous holder.
-            Some(lease) if now >= lease.expires_at => {
-                let generation = lease.generation + 1;
-                db.put_lease(&id, &req.device_id, generation, expires_at)?;
-                Ok(Json(AcquireResponse {
-                    generation,
-                    expires_at,
-                }))
-            }
-            // The current holder re-acquiring refreshes without a bump.
-            Some(lease) if lease.holder == req.device_id => {
-                db.put_lease(&id, &req.device_id, lease.generation, expires_at)?;
-                Ok(Json(AcquireResponse {
-                    generation: lease.generation,
-                    expires_at,
-                }))
-            }
-            Some(lease) => Err(ApiError::Conflict(
-                json!({ "holder": lease.holder, "expires_at": lease.expires_at }),
-            )),
-        }
-    })
-    .await
-}
-
-#[derive(Deserialize)]
-struct HeartbeatRequest {
-    device_id: String,
-    generation: i64,
-}
-
-#[derive(Serialize)]
-struct HeartbeatResponse {
-    expires_at: i64,
-}
-
-async fn lease_heartbeat(
-    Extension(principal): Extension<Principal>,
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    JsonBody(req): JsonBody<HeartbeatRequest>,
-) -> Result<Json<HeartbeatResponse>, ApiError> {
-    block(move || {
-        let db = lock_db(&state)?;
-        require_role(&db, &id, &principal, Role::Writer)?;
-        check_device(&req.device_id)?;
-        match db.get_lease(&id)? {
-            // Expiry is terminal for a generation, exactly as in
-            // acquire: a lapsed lease cannot be revived by heartbeat,
-            // only re-acquired (with a generation bump fencing the stale
-            // holder).
-            Some(lease)
-                if lease.holder == req.device_id
-                    && lease.generation == req.generation
-                    && unix_now() < lease.expires_at =>
-            {
-                let expires_at = unix_now() + state.lease_ttl_secs;
-                db.put_lease(&id, &lease.holder, lease.generation, expires_at)?;
-                Ok(Json(HeartbeatResponse { expires_at }))
-            }
-            _ => Err(ApiError::Fenced(
-                "heartbeat fenced: not the lease holder or stale generation".to_string(),
-            )),
-        }
-    })
-    .await
-}
-
-#[derive(Deserialize)]
-struct TransferRequest {
-    device_id: String,
-    #[allow(dead_code)] // carried by the contract; the decision is §11-pinned
-    generation: i64,
-    base_seq: i64,
-}
-
-#[derive(Serialize)]
-struct TransferResponse {
-    generation: i64,
-}
-
-async fn lease_transfer(
-    Extension(principal): Extension<Principal>,
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    JsonBody(req): JsonBody<TransferRequest>,
-) -> Result<Json<TransferResponse>, ApiError> {
-    block(move || {
-        let db = lock_db(&state)?;
-        require_role(&db, &id, &principal, Role::Writer)?;
-        check_device(&req.device_id)?;
-        // The requester must be synced to the current head so a handoff cannot
-        // silently drop the writer's latest state.
-        let head_seq = db.current_head(&id)?.map(|h| h.seq).unwrap_or(0);
-        if req.base_seq != head_seq {
-            return Err(ApiError::Conflict(json!({ "current_seq": head_seq })));
-        }
-        let now = unix_now();
-        match db.get_lease(&id)? {
-            // A valid lease held by another device requires `force`.
-            Some(lease) if lease.holder != req.device_id && now < lease.expires_at => {
-                Err(ApiError::Conflict(
-                    json!({ "holder": lease.holder, "expires_at": lease.expires_at }),
-                ))
-            }
-            // Already theirs: refresh without a generation bump.
-            Some(lease) if lease.holder == req.device_id => {
-                db.put_lease(
-                    &id,
-                    &lease.holder,
-                    lease.generation,
-                    now + state.lease_ttl_secs,
-                )?;
-                Ok(Json(TransferResponse {
-                    generation: lease.generation,
-                }))
-            }
-            // Expired (or no) lease: hand over, bumping the generation to fence
-            // the old writer.
-            lease => {
-                let generation = lease.map(|l| l.generation + 1).unwrap_or(1);
-                db.put_lease(&id, &req.device_id, generation, now + state.lease_ttl_secs)?;
-                Ok(Json(TransferResponse { generation }))
-            }
-        }
-    })
-    .await
-}
-
-#[derive(Deserialize)]
-struct ForceRequest {
-    device_id: String,
-}
-
-#[derive(Serialize)]
-struct ForceResponse {
-    generation: i64,
-}
-
-async fn lease_force(
-    Extension(principal): Extension<Principal>,
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    JsonBody(req): JsonBody<ForceRequest>,
-) -> Result<Json<ForceResponse>, ApiError> {
-    block(move || {
-        let db = lock_db(&state)?;
-        let ws = require_role(&db, &id, &principal, Role::Writer)?;
-        check_device(&req.device_id)?;
-        let lease = db.get_lease(&id)?;
-        // §12: an overwritten head is never lost — before revoking, record a
-        // checkpoint snapshot of the current head, credited to the outgoing
-        // holder. Skip when there is nothing new to preserve: the forcer
-        // already holds the lease (their head is their own state), or the
-        // newest checkpoint already matches this head. The checkpoint insert
-        // also runs §14 time-based retention (see `Db::insert_snapshot`).
-        if let Some(head) = db.current_head(&id)? {
-            let forcer_holds = lease
-                .as_ref()
-                .is_some_and(|l| l.holder == req.device_id && unix_now() < l.expires_at);
-            let already_captured = db
-                .latest_checkpoint_manifest(&id)?
-                .is_some_and(|m| m == head.manifest);
-            if !forcer_holds && !already_captured {
-                let outgoing = lease
-                    .as_ref()
-                    .map(|l| l.holder.as_str())
-                    .unwrap_or("unknown");
-                // On an e2e workspace the head text is the §24 envelope
-                // (encrypted manifest + chunk_hashes): it checkpoints
-                // verbatim, and its chunk refs were already written by the
-                // head commit (refs are additive-only here, so nothing is
-                // lost by not re-deriving them — and §24's GC rebuild
-                // re-derives them from the envelope if drift ever occurs).
-                let refs = if ws.e2e {
-                    std::collections::HashSet::new()
-                } else {
-                    let manifest: Manifest = serde_json::from_str(&head.manifest)
-                        .map_err(|e| ApiError::Internal(e.into()))?;
-                    chunk_hashes(&manifest)
-                };
-                db.insert_snapshot(
-                    &id,
-                    crate::db::NewSnapshot {
-                        name: None,
-                        kind: "checkpoint",
-                        device: outgoing,
-                        created_at: unix_now(),
-                        manifest: &head.manifest,
-                        refs: &refs,
-                    },
-                )?;
-            }
-        }
-        // Force always succeeds; the generation bump revokes and fences whoever
-        // held the lease before (§11 documents the stranded-changes risk for
-        // state that was never synced to the head).
-        let generation = lease.map(|l| l.generation + 1).unwrap_or(1);
-        db.put_lease(
-            &id,
-            &req.device_id,
-            generation,
-            unix_now() + state.lease_ttl_secs,
-        )?;
-        Ok(Json(ForceResponse { generation }))
     })
     .await
 }

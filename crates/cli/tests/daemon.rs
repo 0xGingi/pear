@@ -150,16 +150,7 @@ fn protocol_and_local_watch_lifecycle() {
     let tgt = root.join("tgt");
     write(&src.join("hello.txt"), b"hello\n");
     let result = ok(
-        &json!({
-            "type": "add_watch",
-            "path": src,
-            "target": tgt,
-            "relay": null,
-            "token": null,
-            "device": null,
-            "force": false,
-            "team": null
-        }),
+        &json!({ "type": "add_watch", "path": src, "target": tgt }),
         &home,
     );
     assert_eq!(result["role"], "watch");
@@ -186,13 +177,22 @@ fn protocol_and_local_watch_lifecycle() {
     );
     assert_eq!(status["workspaces"].as_array().unwrap().len(), 0);
 
-    // Duplicate registration is refused.
+    // Duplicate registration is refused. §32 made concurrent writers
+    // legal ACROSS devices, but two loops on ONE directory are still a
+    // mistake, so the refusal stays.
     let resp = request(
         &home,
         &json!({ "type": "add_watch", "path": src, "target": tgt }),
     )
     .unwrap();
     assert_eq!(resp["ok"], false, "duplicate must error: {resp}");
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap()
+            .contains("already registered"),
+        "{resp}"
+    );
 
     // remove stops it: a post-remove edit never converges. The negative
     // check needs one bounded wait — 2s covers the 500ms debounce + a
@@ -237,6 +237,15 @@ fn daemon_commands_fail_cleanly_without_a_daemon() {
 
     for args in [
         vec!["watch", "src", "tgt", "--daemon"],
+        vec![
+            "sync",
+            "src",
+            "--relay",
+            "http://127.0.0.1:1",
+            "--token",
+            "irrelevant",
+            "--daemon",
+        ],
         vec!["status"],
         vec!["daemon", "stop"],
     ] {
@@ -325,11 +334,11 @@ fn token_is_never_persisted_or_echoed() {
 }
 
 /// Persistence and restart (§16): a LOCAL watch resumes across a daemon
-/// restart; a relay registration whose token is not re-supplied via
-/// PEAR_TOKEN stays registered, reports a clear status error, and does
-/// not run.
+/// restart; a §32 converge registration whose token is not re-supplied
+/// via PEAR_TOKEN stays registered, reports a clear status error, and
+/// does not run.
 #[test]
-fn restart_resumes_local_watch_but_not_tokenless_relay() {
+fn restart_resumes_local_watch_but_not_tokenless_converge() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let home = root.join("home");
@@ -343,30 +352,17 @@ fn restart_resumes_local_watch_but_not_tokenless_relay() {
     {
         let peard = start_peard(&home, None);
         ok(
-            &json!({
-                "type": "add_watch",
-                "path": src,
-                "target": tgt,
-                "relay": null,
-                "token": null,
-                "device": null,
-                "force": false,
-                "team": null
-            }),
+            &json!({ "type": "add_watch", "path": src, "target": tgt }),
             &home,
         );
-        // A relay watch, registered with a token (unreachable relay; the
-        // loop fails but the registration persists).
+        // A §32 converge loop, registered with a token (unreachable
+        // relay; the loop fails but the registration persists).
         ok(
             &json!({
-                "type": "add_watch",
+                "type": "add_converge",
                 "path": writer_dir,
-                "target": null,
                 "relay": "http://127.0.0.1:1",
                 "token": format!("pear-it-{}", "w".repeat(24)),
-                "device": null,
-                "force": false,
-                "team": null
             }),
             &home,
         );
@@ -383,7 +379,7 @@ fn restart_resumes_local_watch_but_not_tokenless_relay() {
     write(&src.join("two.txt"), b"two\n");
     wait_for_file(&tgt.join("two.txt"), b"two\n");
 
-    // The relay watch did not resume: registered, state error, and the
+    // The converge loop did not resume: registered, state error, and the
     // error says why.
     let status = ok(&json!({ "type": "status" }), &home);
     let entries = status["workspaces"].as_array().unwrap();
@@ -391,7 +387,8 @@ fn restart_resumes_local_watch_but_not_tokenless_relay() {
     let relay_entry = entries
         .iter()
         .find(|e| e["path"].as_str() == Some(writer_dir.to_string_lossy().as_ref()))
-        .expect("the relay registration persists");
+        .expect("the converge registration persists");
+    assert_eq!(relay_entry["role"], "sync", "{relay_entry}");
     assert_eq!(relay_entry["state"], "error", "{relay_entry}");
     let error = relay_entry["error"].as_str().unwrap();
     assert!(
@@ -409,12 +406,12 @@ fn restart_resumes_local_watch_but_not_tokenless_relay() {
     wait_for("peard to exit", || child.try_wait().unwrap().is_some());
 }
 
-/// §16 + §17 smoke: a daemon-run watch/mirror pair converges on an e2e
-/// workspace — the loops carry the e2e options (`--e2e`, `--name`)
-/// through unchanged, wrap-maintenance runs at watch start, and the
-/// mirror onboards by fetching and unwrapping its key.
+/// §16 + §17 + §32 smoke: a daemon-run converge/mirror pair converges on
+/// an e2e workspace — `pear join` carries the e2e options (`--e2e`,
+/// `--team`) through unchanged, wrap-maintenance runs at loop start, and
+/// the mirror onboards by fetching and unwrapping its key.
 #[test]
-fn daemon_e2e_watch_mirror_converges() {
+fn daemon_e2e_join_mirror_converges() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let home = root.join("home");
@@ -450,22 +447,6 @@ fn daemon_e2e_watch_mirror_converges() {
     wait_for("the relay to accept connections", || {
         std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok()
     });
-
-    /// Run the pear CLI with a token; assert success and return stdout.
-    fn pear_ok(home: &Path, token: &str, args: &[&str]) -> String {
-        let out = Command::new(env!("CARGO_BIN_EXE_pear"))
-            .env("PEAR_HOME", home)
-            .env("PEAR_TOKEN", token)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "pear {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).into_owned()
-    }
 
     // Operator: create the two users (writer and mirror-side member).
     let w_out = pear_ok(
@@ -525,9 +506,8 @@ fn daemon_e2e_watch_mirror_converges() {
         &home,
         &w_token,
         &[
-            "watch",
+            "join",
             src.to_str().unwrap(),
-            "--daemon",
             "--relay",
             &url,
             "--e2e",
@@ -535,9 +515,9 @@ fn daemon_e2e_watch_mirror_converges() {
             "acme",
         ],
     );
-    // The daemon's watch loop inits the workspace asynchronously — wait
-    // for its metadata before reading the id.
-    wait_for("the watch loop to init the workspace", || {
+    // The daemon's converge loop inits the workspace asynchronously —
+    // wait for its metadata before reading the id.
+    wait_for("the converge loop to init the workspace", || {
         src.join(".pear/workspace.json").exists()
     });
     let workspace: Value =
@@ -583,6 +563,182 @@ fn daemon_e2e_watch_mirror_converges() {
     wait_for("peard to exit", || child.try_wait().unwrap().is_some());
     let _ = relay.kill();
     let _ = relay.wait();
+}
+
+/// §32 end to end at the CLI: TWO concurrent converge loops on ONE
+/// workspace, each supervised by its own `peard`, against one real relay.
+/// Both devices' edits land on both sides — no lease, no handoff, no
+/// manual command after `join` — and each device's own `join` is what
+/// starts its daemon (the socket is absent until then).
+#[test]
+fn two_joined_devices_converge_concurrently() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let admin_token = format!("pear-adm-{}", "c".repeat(24));
+    let relay = start_relay(&root, &admin_token);
+
+    // Device A joins a fresh workspace; its `join` must start peard.
+    let home_a = root.join("home-a");
+    let dir_a = root.join("a");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    write(&dir_a.join("from-a.txt"), b"a1\n");
+    std::fs::create_dir_all(&home_a).unwrap();
+    assert!(
+        !home_a.join("daemon.sock").exists(),
+        "no daemon before join"
+    );
+    let _peard_a = PeardHandle::adopt(&home_a);
+    pear_ok(
+        &home_a,
+        &admin_token,
+        &["join", dir_a.to_str().unwrap(), "--relay", &relay.url],
+    );
+    assert!(
+        home_a.join("daemon.sock").exists(),
+        "join auto-started peard (§32)"
+    );
+    wait_for("device A to publish its workspace", || {
+        dir_a.join(".pear/workspace.json").exists()
+    });
+    let workspace: Value =
+        serde_json::from_slice(&std::fs::read(dir_a.join(".pear/workspace.json")).unwrap())
+            .unwrap();
+    let ws_id = workspace["id"].as_str().unwrap().to_string();
+
+    // Device B joins the SAME workspace into an empty directory: the
+    // first converge materializes it.
+    let home_b = root.join("home-b");
+    let dir_b = root.join("b");
+    std::fs::create_dir_all(&dir_b).unwrap();
+    std::fs::create_dir_all(&home_b).unwrap();
+    let _peard_b = PeardHandle::adopt(&home_b);
+    pear_ok(
+        &home_b,
+        &admin_token,
+        &[
+            "join",
+            dir_b.to_str().unwrap(),
+            "--relay",
+            &relay.url,
+            "--workspace",
+            &ws_id,
+            "--device",
+            "device-b",
+        ],
+    );
+    wait_for_file(&dir_b.join("from-a.txt"), b"a1\n");
+
+    // Now both write, concurrently, with nobody holding anything: each
+    // edit reaches the other device.
+    write(&dir_b.join("from-b.txt"), b"b1\n");
+    write(&dir_a.join("from-a2.txt"), b"a2\n");
+    wait_for_file(&dir_a.join("from-b.txt"), b"b1\n");
+    wait_for_file(&dir_b.join("from-a2.txt"), b"a2\n");
+
+    // ...and again, in the other order, to prove neither side wedged.
+    write(&dir_a.join("from-a3.txt"), b"a3\n");
+    write(&dir_b.join("from-b2.txt"), b"b2\n");
+    wait_for_file(&dir_b.join("from-a3.txt"), b"a3\n");
+    wait_for_file(&dir_a.join("from-b2.txt"), b"b2\n");
+
+    // Both loops report the converge role and no error.
+    for home in [&home_a, &home_b] {
+        let status = ok(&json!({ "type": "status" }), home);
+        let entries = status["workspaces"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{status}");
+        assert_eq!(entries[0]["role"], "sync", "{status}");
+        assert_eq!(entries[0]["error"], Value::Null, "{status}");
+    }
+
+    for home in [&home_a, &home_b] {
+        ok(&json!({ "type": "shutdown" }), home);
+    }
+}
+
+/// A peard this test did not spawn (`pear join` did): killed on drop via
+/// its recorded pid file, so a failed assertion never leaks a daemon.
+struct PeardHandle {
+    home: PathBuf,
+}
+
+impl PeardHandle {
+    fn adopt(home: &Path) -> Self {
+        Self {
+            home: home.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for PeardHandle {
+    fn drop(&mut self) {
+        // Best effort: ask it to stop over its own socket.
+        let _ = request(&self.home, &json!({ "type": "shutdown" }));
+    }
+}
+
+/// A real `pear-relay` child on an ephemeral port; killed on drop.
+struct TestRelay {
+    child: Option<Child>,
+    url: String,
+}
+
+impl Drop for TestRelay {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Spawn the real relay binary (it lives next to peard in the target dir).
+fn start_relay(root: &Path, token: &str) -> TestRelay {
+    let relay_bin = Path::new(env!("CARGO_BIN_EXE_peard"))
+        .parent()
+        .unwrap()
+        .join("pear-relay");
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let child = Command::new(&relay_bin)
+        .args([
+            "--addr",
+            &format!("127.0.0.1:{port}"),
+            "--token",
+            token,
+            "--data-dir",
+            &root.join("relay-data").to_string_lossy(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(root.join("relay.log")).unwrap(),
+        ))
+        .spawn()
+        .expect("spawn pear-relay");
+    wait_for("the relay to accept connections", || {
+        std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok()
+    });
+    TestRelay {
+        child: Some(child),
+        url: format!("http://127.0.0.1:{port}"),
+    }
+}
+
+/// Run the pear CLI with a token; assert success and return stdout.
+fn pear_ok(home: &Path, token: &str, args: &[&str]) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_pear"))
+        .env("PEAR_HOME", home)
+        .env("PEAR_TOKEN", token)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "pear {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 /// Recursively assert no file under `dir` contains `needle`.

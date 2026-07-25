@@ -3,14 +3,15 @@
 //! pear-core is a synchronous crate; the CLI runs cycles on plain threads.
 //!
 //! Wire conventions pinned by §11: bearer token on every request, JSON
-//! bodies, `X-Pear-Device`/`X-Pear-Generation` lease headers on head
-//! commits. Sequence numbers are `u64` with **0 meaning "no head yet"** —
+//! bodies, an `X-Pear-Device` attribution header on head commits (§32
+//! retired the lease/fencing headers). Sequence numbers are `u64` with
+//! **0 meaning "no head yet"** —
 //! sent as `0` rather than `null` so both `u64` and `Option<u64>` server
 //! shapes accept it.
 
 use std::fmt;
 use std::io::Read as _;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,9 +21,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::manifest::Manifest;
 use crate::store::{ChunkSink, ChunkSource};
-
-/// A lease generation that has not been acquired yet.
-const NO_GENERATION: u64 = 0;
 
 /// Per-request ceiling for control-plane calls so a wedged relay cannot
 /// block a sync cycle forever.
@@ -39,26 +37,15 @@ const DATA_TIMEOUT: Duration = Duration::from_secs(600);
 /// lists transparently.
 const MISSING_BATCH: usize = 50_000;
 
-/// Errors from relay calls, split so the writer/mirror flows can tell a
-/// lost lease (fatal) from a transient transport failure (retry).
+/// Errors from relay calls, split so the converge/mirror flows can tell a
+/// deterministic rejection (fatal) from a transient transport failure
+/// (retry) and from a CAS conflict (re-merge and retry — §32).
 #[derive(Debug)]
 pub enum RelayError {
-    /// 403: the lease is held by another device, the generation is stale,
-    /// or the lease expired. The writer no longer owns the head.
-    Fenced(String),
-    /// 409 on `PUT /head`: the head moved past our `base_seq`.
+    /// 409 on `PUT /head`: the head moved past our `base_seq`. §32: the
+    /// ordinary outcome of concurrent writers — converge re-merges
+    /// against the new head and retries.
     HeadConflict { current_seq: u64 },
-    /// 409 on lease acquire: another device holds a valid lease.
-    LeaseHeld {
-        holder: String,
-        expires_at: Option<String>,
-    },
-    /// 409 on lease transfer: requester not synced to head, or the current
-    /// lease is neither expired nor the requester's.
-    TransferRejected {
-        holder: Option<String>,
-        expires_at: Option<String>,
-    },
     /// 404: workspace, head, or chunk does not exist.
     NotFound(String),
     /// A deterministic local-side rejection of relay data (invalid
@@ -74,21 +61,9 @@ pub enum RelayError {
 impl fmt::Display for RelayError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            RelayError::Fenced(why) => write!(f, "fenced: {why}"),
             RelayError::HeadConflict { current_seq } => {
                 write!(f, "head conflict: relay head is at seq {current_seq}")
             }
-            RelayError::LeaseHeld { holder, expires_at } => {
-                write!(f, "lease held by {holder}{}", fmt_expiry(expires_at))
-            }
-            RelayError::TransferRejected { holder, expires_at } => match holder {
-                Some(holder) => write!(
-                    f,
-                    "transfer rejected: lease held by {holder}{}",
-                    fmt_expiry(expires_at)
-                ),
-                None => write!(f, "transfer rejected: requester not synced to head"),
-            },
             RelayError::NotFound(what) => write!(f, "not found: {what}"),
             RelayError::Fatal(what) => write!(f, "fatal: {what}"),
             RelayError::Http { status, body } => write!(f, "HTTP {status}: {body}"),
@@ -98,33 +73,6 @@ impl fmt::Display for RelayError {
 }
 
 impl std::error::Error for RelayError {}
-
-fn fmt_expiry(expires_at: &Option<String>) -> String {
-    expires_at
-        .as_ref()
-        .map(|e| format!(" (expires {e})"))
-        .unwrap_or_default()
-}
-
-/// From a 403 body: lease fencing carries `"fenced": true` and maps to
-/// `Fenced`; any other 403 is an auth/role failure and stays a generic
-/// `Http` error, so the CLI's "token or role revoked" diagnostic can
-/// fire instead of the misleading "LEASE LOST".
-fn forbidden_from(body: &str) -> RelayError {
-    #[derive(Deserialize)]
-    struct ErrBody {
-        error: String,
-        #[serde(default)]
-        fenced: bool,
-    }
-    match serde_json::from_str::<ErrBody>(body) {
-        Ok(parsed) if parsed.fenced => RelayError::Fenced(parsed.error),
-        _ => RelayError::Http {
-            status: 403,
-            body: body.to_string(),
-        },
-    }
-}
 
 /// From a 409 on `PUT /head`: a CAS conflict carries `current_seq`; the
 /// §17 flavor mismatch (`kind: "e2e_mismatch"` — a plaintext head on an
@@ -158,15 +106,6 @@ fn head_conflict(body: &str) -> RelayError {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct LeaseInfo {
-    pub holder: String,
-    pub generation: u64,
-    /// Server-defined timestamp (unix secs or RFC3339); carried opaquely.
-    #[serde(default)]
-    pub expires_at: serde_json::Value,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct WorkspaceInfo {
     pub id: String,
     pub name: String,
@@ -174,8 +113,6 @@ pub struct WorkspaceInfo {
     pub head_seq: u64,
     #[serde(default)]
     pub head_hash: Option<String>,
-    #[serde(default)]
-    pub lease: Option<LeaseInfo>,
     /// The team this workspace is attached to, if any.
     #[serde(default)]
     pub team_id: Option<String>,
@@ -194,8 +131,6 @@ struct WorkspaceWire {
     #[serde(default)]
     head_hash: Option<String>,
     #[serde(default)]
-    lease: Option<LeaseInfo>,
-    #[serde(default)]
     team_id: Option<String>,
     #[serde(default)]
     e2e: bool,
@@ -208,7 +143,6 @@ impl From<WorkspaceWire> for WorkspaceInfo {
             name: wire.name,
             head_seq: wire.head_seq.unwrap_or(0),
             head_hash: wire.head_hash,
-            lease: wire.lease,
             team_id: wire.team_id,
             e2e: wire.e2e,
         }
@@ -236,7 +170,7 @@ pub struct HeadCommit {
 }
 
 /// A snapshot's metadata, as listed by `GET .../snapshots` (§12). `kind`
-/// is `named` (CLI-made) or `checkpoint` (relay-made on lease force).
+/// is `named` (CLI-made); pre-§32 relays also wrote `checkpoint` rows.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SnapshotInfo {
     pub id: u64,
@@ -313,15 +247,14 @@ pub struct UserKeyBundle {
 }
 
 /// Blocking client for one workspace on one relay. Cheap to clone; clones
-/// share the connection pool and the lease generation, so a heartbeat
-/// thread and the writer loop always fence on the same state.
+/// share the connection pool and the §28 `.env` policy, so every clone
+/// sees the same learned state.
 #[derive(Clone)]
 pub struct RelayClient {
     base_url: String,
     auth: String,
     workspace_id: String,
     device_id: String,
-    generation: Arc<AtomicU64>,
     agent: ureq::Agent,
     /// Separate agent for data-path calls (head, chunks): large payloads
     /// get the longer DATA_TIMEOUT ceiling instead of the 30s default.
@@ -331,11 +264,11 @@ pub struct RelayClient {
     /// `--cacert` semantics. `None` keeps ureq/tungstenite defaults.
     tls_ca: Option<Arc<Vec<CertificateDer<'static>>>>,
     /// §28: the attached team's `.env` policy as learned by the writer at
-    /// watch startup. `Some(team_name)` = that team FORBIDS `.env` sync,
+    /// converge startup. `Some(team_name)` = that team FORBIDS `.env` sync,
     /// and a push cycle whose scan captures `.env*` files refuses loudly
     /// (the only line for e2e; the relay 409s plaintext commits itself).
-    /// Shared across clones like the lease generation: every clone of this
-    /// client must agree on the policy.
+    /// Shared across clones: every clone of this client must agree on the
+    /// policy.
     env_sync_forbidden_by: Arc<std::sync::Mutex<Option<String>>>,
 }
 
@@ -379,7 +312,6 @@ impl RelayClient {
             auth: format!("Bearer {token}"),
             workspace_id: workspace_id.to_string(),
             device_id: device_id.to_string(),
-            generation: Arc::new(AtomicU64::new(NO_GENERATION)),
             agent: ureq::Agent::new_with_config(config),
             data_agent: ureq::Agent::new_with_config(data_config),
             tls_ca,
@@ -393,7 +325,7 @@ impl RelayClient {
         &self.workspace_id
     }
 
-    /// §28: record the attached team's `.env` policy, learned at watch
+    /// §28: record the attached team's `.env` policy, learned at loop
     /// startup. `Some(team_name)` forbids `.env` sync (push cycles whose
     /// scan captures `.env*` files refuse); `None` allows it — either the
     /// team does or the workspace has no team at all.
@@ -431,21 +363,6 @@ impl RelayClient {
 
     pub fn device_id(&self) -> &str {
         &self.device_id
-    }
-
-    /// The lease generation this device believes it holds; `None` until a
-    /// successful acquire/transfer/force sets it.
-    pub fn generation(&self) -> Option<u64> {
-        match self.generation.load(Ordering::SeqCst) {
-            NO_GENERATION => None,
-            g => Some(g),
-        }
-    }
-
-    /// Record a generation handed out by the relay. Public so tests and
-    /// future flows can adopt an externally observed generation.
-    pub fn set_generation(&self, generation: u64) {
-        self.generation.store(generation, Ordering::SeqCst);
     }
 
     fn url(&self, path: &str) -> String {
@@ -620,66 +537,55 @@ impl RelayClient {
         }
     }
 
-    /// Commit a new head (compare-and-swap on `base_seq`, 0 = no head yet).
-    /// Carries the lease headers; 403 means fenced, 409 means the head moved.
+    /// §32 head commit: compare-and-swap on `base_seq` (0 = no head yet),
+    /// which is the whole of the concurrency control — there are no
+    /// leases and no fencing. 409 means another writer advanced the head,
+    /// so converge re-merges against it and retries; 403 means the role
+    /// was revoked (or was never Writer).
     pub fn put_head(&self, base_seq: u64, manifest: &Manifest) -> Result<HeadCommit, RelayError> {
-        let generation = self.generation().ok_or_else(|| {
-            RelayError::Fenced("no lease generation: acquire the lease first".to_string())
-        })?;
         #[derive(Serialize)]
         struct Body<'a> {
             base_seq: u64,
             manifest: &'a Manifest,
         }
-        let mut resp = self
-            .data_agent
-            .put(self.url("/head"))
-            .header("Authorization", &self.auth)
-            .header("X-Pear-Device", &self.device_id)
-            .header("X-Pear-Generation", generation.to_string())
-            .send_json(Body { base_seq, manifest })
-            .map_err(transport)?;
-        match resp.status().as_u16() {
-            200 => read_json(&mut resp, "head commit"),
-            403 => Err(forbidden_from(&body_string(&mut resp))),
-            409 => Err(head_conflict(&body_string(&mut resp))),
-            status => Err(http_error("put head", status, &mut resp)),
-        }
+        self.send_head(Body { base_seq, manifest })
     }
 
     /// §17: commit a new head on an e2e workspace — the encrypted manifest
-    /// (base64) plus the ciphertext hashes it references. Same CAS and
-    /// fencing as `put_head`; the relay cannot see the manifest itself.
+    /// (base64) plus the ciphertext hashes it references. Same CAS as
+    /// `put_head`; the relay cannot see the manifest itself.
     pub fn put_head_e2e(
         &self,
         base_seq: u64,
         manifest_enc: &str,
         chunk_hashes: &[String],
     ) -> Result<HeadCommit, RelayError> {
-        let generation = self.generation().ok_or_else(|| {
-            RelayError::Fenced("no lease generation: acquire the lease first".to_string())
-        })?;
         #[derive(Serialize)]
         struct Body<'a> {
             base_seq: u64,
             manifest_enc: &'a str,
             chunk_hashes: &'a [String],
         }
+        self.send_head(Body {
+            base_seq,
+            manifest_enc,
+            chunk_hashes,
+        })
+    }
+
+    /// The shared `PUT /head` request: identical status handling for every
+    /// flavor. `X-Pear-Device` is attribution only (§32) — the relay
+    /// requires it but never authorizes on it.
+    fn send_head<B: Serialize>(&self, body: B) -> Result<HeadCommit, RelayError> {
         let mut resp = self
             .data_agent
             .put(self.url("/head"))
             .header("Authorization", &self.auth)
             .header("X-Pear-Device", &self.device_id)
-            .header("X-Pear-Generation", generation.to_string())
-            .send_json(Body {
-                base_seq,
-                manifest_enc,
-                chunk_hashes,
-            })
+            .send_json(body)
             .map_err(transport)?;
         match resp.status().as_u16() {
             200 => read_json(&mut resp, "head commit"),
-            403 => Err(forbidden_from(&body_string(&mut resp))),
             409 => Err(head_conflict(&body_string(&mut resp))),
             status => Err(http_error("put head", status, &mut resp)),
         }
@@ -879,7 +785,7 @@ impl RelayClient {
         Ok(out)
     }
 
-    /// Record an immutable snapshot of `manifest` (§12): no lease, no CAS —
+    /// Record an immutable snapshot of `manifest` (§12): no CAS —
     /// a snapshot moves nothing. This device is recorded as the creator.
     pub fn create_snapshot(
         &self,
@@ -1032,147 +938,6 @@ impl RelayClient {
                 self.workspace_id
             ))),
             status => Err(http_error("get snapshot", status, &mut resp)),
-        }
-    }
-
-    /// Acquire (or re-affirm) the lease; stores the generation on success.
-    pub fn acquire(&self) -> Result<u64, RelayError> {
-        #[derive(Serialize)]
-        struct Body<'a> {
-            device_id: &'a str,
-        }
-        #[derive(Deserialize)]
-        struct Granted {
-            generation: u64,
-        }
-        let mut resp = self
-            .agent
-            .post(self.url("/lease/acquire"))
-            .header("Authorization", &self.auth)
-            .send_json(Body {
-                device_id: &self.device_id,
-            })
-            .map_err(transport)?;
-        match resp.status().as_u16() {
-            200 => {
-                let granted: Granted = read_json(&mut resp, "lease acquire")?;
-                self.set_generation(granted.generation);
-                Ok(granted.generation)
-            }
-            409 => {
-                let body = body_string(&mut resp);
-                Err(match lease_holder(&body) {
-                    Some((holder, expires_at)) => RelayError::LeaseHeld { holder, expires_at },
-                    None => RelayError::Http { status: 409, body },
-                })
-            }
-            status => Err(http_error("lease acquire", status, &mut resp)),
-        }
-    }
-
-    /// Heartbeat the held lease; 403 means we have been fenced.
-    pub fn heartbeat(&self) -> Result<(), RelayError> {
-        let generation = self.generation().ok_or_else(|| {
-            RelayError::Fenced("no lease generation: acquire the lease first".to_string())
-        })?;
-        #[derive(Serialize)]
-        struct Body<'a> {
-            device_id: &'a str,
-            generation: u64,
-        }
-        let mut resp = self
-            .agent
-            .post(self.url("/lease/heartbeat"))
-            .header("Authorization", &self.auth)
-            .send_json(Body {
-                device_id: &self.device_id,
-                generation,
-            })
-            .map_err(transport)?;
-        match resp.status().as_u16() {
-            200 => Ok(()),
-            403 => Err(forbidden_from(&body_string(&mut resp))),
-            status => Err(http_error("lease heartbeat", status, &mut resp)),
-        }
-    }
-
-    /// Ask the relay to hand the lease to this device (§11: allowed when
-    /// synced to head and the current lease is expired or already ours).
-    /// Sends the last observed generation, read from the workspace record.
-    pub fn transfer(&self, base_seq: u64) -> Result<u64, RelayError> {
-        let observed = self
-            .get_workspace()?
-            .lease
-            .map(|l| l.generation)
-            .unwrap_or(NO_GENERATION);
-        #[derive(Serialize)]
-        struct Body<'a> {
-            device_id: &'a str,
-            generation: u64,
-            base_seq: u64,
-        }
-        #[derive(Deserialize)]
-        struct Granted {
-            generation: u64,
-        }
-        let mut resp = self
-            .agent
-            .post(self.url("/lease/transfer"))
-            .header("Authorization", &self.auth)
-            .send_json(Body {
-                device_id: &self.device_id,
-                generation: observed,
-                base_seq,
-            })
-            .map_err(transport)?;
-        match resp.status().as_u16() {
-            200 => {
-                let granted: Granted = read_json(&mut resp, "lease transfer")?;
-                self.set_generation(granted.generation);
-                Ok(granted.generation)
-            }
-            409 => {
-                let body = body_string(&mut resp);
-                let (holder, expires_at) = lease_holder(&body).unwrap_or((String::new(), None));
-                Err(RelayError::TransferRejected {
-                    holder: if holder.is_empty() {
-                        None
-                    } else {
-                        Some(holder)
-                    },
-                    expires_at,
-                })
-            }
-            status => Err(http_error("lease transfer", status, &mut resp)),
-        }
-    }
-
-    /// Force-take the lease; always succeeds, bumps the generation and
-    /// fences the previous writer.
-    pub fn force(&self) -> Result<u64, RelayError> {
-        #[derive(Serialize)]
-        struct Body<'a> {
-            device_id: &'a str,
-        }
-        #[derive(Deserialize)]
-        struct Granted {
-            generation: u64,
-        }
-        let mut resp = self
-            .agent
-            .post(self.url("/lease/force"))
-            .header("Authorization", &self.auth)
-            .send_json(Body {
-                device_id: &self.device_id,
-            })
-            .map_err(transport)?;
-        match resp.status().as_u16() {
-            200 => {
-                let granted: Granted = read_json(&mut resp, "lease force")?;
-                self.set_generation(granted.generation);
-                Ok(granted.generation)
-            }
-            status => Err(http_error("lease force", status, &mut resp)),
         }
     }
 
@@ -1669,7 +1434,7 @@ fn agent_config(
     tls_ca: &Option<Arc<Vec<CertificateDer<'static>>>>,
 ) -> ureq::config::Config {
     let builder = ureq::Agent::config_builder()
-        // 4xx/5xx carry typed meaning (fencing, conflicts): read their
+        // 4xx/5xx carry typed meaning (role failures, CAS conflicts): read their
         // bodies instead of letting ureq flatten them into one error.
         .http_status_as_error(false)
         .timeout_global(Some(timeout));
@@ -1760,24 +1525,6 @@ fn http_error(op: &str, status: u16, resp: &mut ureq::http::Response<ureq::Body>
         status,
         body: format!("{op} failed: {}", body_string(resp)),
     }
-}
-
-/// Parse a `{ holder, expires_at }` conflict body; `expires_at` may be a
-/// string or a unix timestamp.
-fn lease_holder(body: &str) -> Option<(String, Option<String>)> {
-    #[derive(Deserialize)]
-    struct Held {
-        holder: String,
-        #[serde(default)]
-        expires_at: serde_json::Value,
-    }
-    let held: Held = serde_json::from_str(body).ok()?;
-    let expires_at = match &held.expires_at {
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Null => None,
-        other => Some(other.to_string()),
-    };
-    Some((held.holder, expires_at))
 }
 
 // --- WebSocket head feed (§14 hints, §21 catch-up + reconnect) --------------
@@ -2180,27 +1927,6 @@ mod tests {
             elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(3),
             "the total wait must be one interval, not two: {elapsed:?}"
         );
-    }
-
-    #[test]
-    fn forbidden_from_distinguishes_fencing_from_auth() {
-        // Lease fencing (the relay marks the body) → Fenced.
-        match forbidden_from(r#"{"error":"heartbeat fenced: not the lease holder","fenced":true}"#)
-        {
-            RelayError::Fenced(why) => assert!(why.contains("heartbeat fenced")),
-            other => panic!("expected Fenced, got {other:?}"),
-        }
-        // Auth/role 403 (no marker) → generic Http, so the CLI prints its
-        // "token or role revoked" diagnostic instead of "LEASE LOST".
-        match forbidden_from(r#"{"error":"insufficient role"}"#) {
-            RelayError::Http { status, .. } => assert_eq!(status, 403),
-            other => panic!("expected Http 403, got {other:?}"),
-        }
-        // Free-form/empty bodies stay generic too.
-        match forbidden_from("") {
-            RelayError::Http { status, .. } => assert_eq!(status, 403),
-            other => panic!("expected Http 403, got {other:?}"),
-        }
     }
 
     #[test]

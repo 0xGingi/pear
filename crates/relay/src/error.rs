@@ -8,16 +8,12 @@ use serde_json::json;
 pub(crate) enum ApiError {
     /// Malformed JSON, invalid chunk hash, unsafe manifest path.
     BadRequest(String),
-    /// Lease fencing: wrong holder, stale generation, expired lease. The
-    /// body carries `"fenced": true` so a client can tell lease loss
-    /// apart from an auth/role 403 (they share the status code).
-    Fenced(String),
     /// Auth/role failures: admin-only routes, insufficient role.
     Forbidden(String),
     /// Unknown workspace, chunk, or head.
     NotFound(String),
-    /// CAS conflict on the head log or lease held by another device. Body
-    /// shapes are pinned by §11 (`{ current_seq }`, `{ holder, expires_at }`).
+    /// CAS conflict on the head log (§32: the only concurrency control).
+    /// The body shape is pinned by §11 (`{ current_seq }`).
     Conflict(serde_json::Value),
     /// Server-side failure: logged, reported as a plain 500.
     Internal(anyhow::Error),
@@ -35,11 +31,6 @@ impl IntoResponse for ApiError {
             Self::BadRequest(msg) => {
                 (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
             }
-            Self::Fenced(msg) => (
-                StatusCode::FORBIDDEN,
-                Json(json!({ "error": msg, "fenced": true })),
-            )
-                .into_response(),
             Self::Forbidden(msg) => {
                 (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response()
             }

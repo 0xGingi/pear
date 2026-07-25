@@ -1,6 +1,7 @@
-//! End-to-end: pear-core writer/mirror flows against a real pear-relay
-//! server (§11). Covers push/pull convergence (including `.env` and
-//! `.git`), fencing of a second device, and lease handoff after expiry.
+//! End-to-end: pear-core converge/writer/mirror flows against a real
+//! pear-relay server (§11). Covers push/pull convergence (including `.env`
+//! and `.git`) and the §32 multi-writer contract: two concurrent converge
+//! loops against one relay, CAS conflicts, and conflict copies.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -12,13 +13,13 @@ use pear_core::sync::{pull_once, push_cycle, PushError};
 const TOKEN: &str = "e2e-token";
 
 /// Spawn the relay on an ephemeral port; return its base URL.
-async fn start_relay(data_dir: &Path, lease_ttl_secs: u64) -> String {
+async fn start_relay(data_dir: &Path) -> String {
     // Bind first and pass the listener: no bind-then-drop port race.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let dir = data_dir.to_path_buf();
     tokio::spawn(async move {
-        pear_relay::serve_on(listener, TOKEN, &dir, lease_ttl_secs)
+        pear_relay::serve_on(listener, TOKEN, &dir)
             .await
             .expect("relay serve failed");
     });
@@ -75,7 +76,7 @@ fn tree(dir: &Path) -> BTreeMap<String, Vec<u8>> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn writer_push_mirror_pull_converges() {
     let tmp = tempfile::tempdir().unwrap();
-    let url = start_relay(&tmp.path().join("relay"), 300).await;
+    let url = start_relay(&tmp.path().join("relay")).await;
 
     // Writer dir A, including the files that define the product: `.env`
     // and `.git` contents sync.
@@ -90,7 +91,6 @@ async fn writer_push_mirror_pull_converges() {
     let writer = RelayClient::new(&url, TOKEN, &meta.id, "device-a");
     wait_ready(&url).await;
     writer.create_workspace("a").unwrap();
-    writer.acquire().unwrap();
 
     let pushed = push_cycle(&dir_a, &writer, 0, false).unwrap();
     assert!(pushed.committed);
@@ -132,127 +132,14 @@ async fn writer_push_mirror_pull_converges() {
     assert!(!pull_once(&dir_b, &mirror).unwrap().changed);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn second_device_is_fenced_while_first_holds_lease() {
-    let tmp = tempfile::tempdir().unwrap();
-    let url = start_relay(&tmp.path().join("relay"), 300).await;
 
-    let dir_a = tmp.path().join("a");
-    std::fs::create_dir_all(&dir_a).unwrap();
-    write(&dir_a, "f.txt", b"v1\n");
-    let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
-
-    let second = RelayClient::new(&url, TOKEN, &meta.id, "device-b");
-    wait_ready(&url).await;
-    second.create_workspace("a").unwrap();
-
-    // The second device acquires first, then the first device takes the
-    // lease by force: the second now holds a stale generation.
-    second.acquire().unwrap();
-    let first = RelayClient::new(&url, TOKEN, &meta.id, "device-a");
-    first.force().unwrap();
-
-    // While the first device holds the lease, the second cannot acquire...
-    let err = second.acquire().unwrap_err();
-    assert!(
-        matches!(err, RelayError::LeaseHeld { ref holder, .. } if holder == "device-a"),
-        "got {err:?}"
-    );
-    // ...and its push is fenced (403).
-    write(&dir_a, "f.txt", b"v2\n");
-    let err = push_cycle(&dir_a, &second, 0, false).unwrap_err();
-    assert!(matches!(err, PushError::Fenced(_)), "got {err:?}");
-
-    // The holder pushes fine.
-    first.create_workspace("a").unwrap(); // idempotent
-    let pushed = push_cycle(&dir_a, &first, 0, false).unwrap();
-    assert!(pushed.committed);
-}
-
-/// Push with a freshly renewed lease, tolerating an early expiry fence:
-/// the relay expires leases on whole-second boundaries, so a lease lives
-/// between TTL-1 and TTL seconds of wall clock, and an acquire→push gap
-/// on a loaded machine can outlive it. Only `Fenced` is retried — here a
-/// fence can only mean the lease lapsed early, since no other device ever
-/// holds it — and each re-acquire bumps the generation, which callers
-/// read back from the client instead of assuming.
-fn push_with_fresh_lease(
-    dir: &Path,
-    client: &RelayClient,
-    base_seq: u64,
-) -> pear_core::sync::PushReport {
-    for _ in 0..3 {
-        // Renew immediately before the push so the commit gets a full TTL
-        // of budget; a lapsed lease is re-acquired first.
-        if let Err(RelayError::Fenced(_)) = client.heartbeat() {
-            client.acquire().unwrap();
-        }
-        match push_cycle(dir, client, base_seq, false) {
-            Err(PushError::Fenced(_)) => {
-                client.acquire().unwrap();
-            }
-            result => return result.unwrap(),
-        }
-    }
-    panic!("push stayed fenced across three lease renewals")
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn handoff_after_lease_lapse_fences_old_writer() {
-    let tmp = tempfile::tempdir().unwrap();
-    // Leases expire on whole-second boundaries, so their real lifetime is
-    // TTL minus up to one second — the old 1s TTL could lapse milliseconds
-    // after acquire, before the first push landed (the parallel-load
-    // flake). 5s keeps the lapse below a real expiry (a sleep past the
-    // TTL) while leaving seconds of slack for every acquire→push gap.
-    const TTL: u64 = 5;
-    let url = start_relay(&tmp.path().join("relay"), TTL).await;
-
-    let dir_a = tmp.path().join("a");
-    std::fs::create_dir_all(&dir_a).unwrap();
-    write(&dir_a, "f.txt", b"from-a\n");
-    let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
-
-    let first = RelayClient::new(&url, TOKEN, &meta.id, "device-a");
-    wait_ready(&url).await;
-    first.create_workspace("a").unwrap();
-    first.acquire().unwrap();
-    let pushed = push_with_fresh_lease(&dir_a, &first, 0);
-    assert_eq!(pushed.head_seq, 1);
-    // The generation A settled on; a retry above may have re-acquired.
-    let gen_a = first.generation().unwrap();
-
-    // Device B mirrors the workspace, then the lease lapses: a real sleep
-    // past the TTL, with margin for a loaded machine.
-    let dir_b = tmp.path().join("b");
-    pear_core::init_workspace(&dir_b, Some(&meta.id)).unwrap();
-    let second = RelayClient::new(&url, TOKEN, &meta.id, "device-b");
-    assert!(pull_once(&dir_b, &second).unwrap().changed);
-    tokio::time::sleep(Duration::from_secs(TTL + 2)).await;
-
-    // B acquires the expired lease — exactly one generation bump fences
-    // A — and becomes the writer: its push from the mirrored tree
-    // succeeds.
-    let gen = second.acquire().unwrap();
-    assert_eq!(gen, gen_a + 1);
-    write(&dir_b, "f.txt", b"from-b\n");
-    let pushed = push_with_fresh_lease(&dir_b, &second, 1);
-    assert!(pushed.committed);
-    assert_eq!(pushed.head_seq, 2);
-
-    // The old writer's next push is fenced: its generation is stale no
-    // matter how much wall clock the handoff took.
-    write(&dir_a, "f.txt", b"a-strikes-back\n");
-    let err = push_cycle(&dir_a, &first, 1, false).unwrap_err();
-    assert!(matches!(err, PushError::Fenced(_)), "got {err:?}");
-}
 
 /// M3 end-to-end (§12): snapshot -> clone (forked lineage, byte-identical
-/// tree) and force -> checkpoint, all through the real client and relay.
+/// tree), all through the real client and relay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn snapshot_clone_and_force_checkpoint() {
+async fn snapshot_and_clone_round_trip() {
     let tmp = tempfile::tempdir().unwrap();
-    let url = start_relay(&tmp.path().join("relay"), 300).await;
+    let url = start_relay(&tmp.path().join("relay")).await;
 
     // Writer pushes a tree, including `.env` and `.git` contents.
     let dir_a = tmp.path().join("a");
@@ -265,7 +152,6 @@ async fn snapshot_clone_and_force_checkpoint() {
     let writer = RelayClient::new(&url, TOKEN, &meta.id, "device-a");
     wait_ready(&url).await;
     writer.create_workspace("a").unwrap();
-    writer.acquire().unwrap();
     let pushed = push_cycle(&dir_a, &writer, 0, false).unwrap();
     assert_eq!(pushed.head_seq, 1);
 
@@ -307,29 +193,83 @@ async fn snapshot_clone_and_force_checkpoint() {
     assert_eq!(snap.id, 2);
     assert_eq!(writer.get_head().unwrap().unwrap().seq, 1, "head unmoved");
 
-    // Force takeover checkpoints the overwritten head first (§12).
-    let second = RelayClient::new(&url, TOKEN, &meta.id, "device-b");
-    second.force().unwrap();
+    // Both snapshots are listed newest-first, named, and attributed.
     let snapshots = writer.list_snapshots().unwrap();
-    assert_eq!(snapshots.len(), 3);
-    assert_eq!(snapshots[0].kind, "checkpoint", "newest first");
-    assert_eq!(snapshots[0].device, "device-a", "the outgoing holder");
-    assert!(snapshots[0].name.is_none());
-    assert_eq!(snapshots[1].kind, "named");
-    assert_eq!(snapshots[1].name.as_deref(), Some("wip"));
-    assert_eq!(snapshots[2].name.as_deref(), Some("release candidate"));
+    assert_eq!(snapshots.len(), 2);
+    assert_eq!(snapshots[0].kind, "named", "newest first");
+    assert_eq!(snapshots[0].device, "device-a");
+    assert_eq!(snapshots[0].name.as_deref(), Some("wip"));
+    assert_eq!(snapshots[1].name.as_deref(), Some("release candidate"));
 
-    // The checkpoint preserves the head that force revoked, manifest and
-    // all; cloning IT yields the synced tree (no wip.txt).
-    let checkpoint = writer.get_snapshot(snapshots[0].id).unwrap();
-    assert_eq!(checkpoint.manifest, head_manifest);
+    // The head-synced snapshot preserves the head manifest exactly;
+    // cloning IT yields the synced tree (no wip.txt).
+    let released = writer.get_snapshot(snapshots[1].id).unwrap();
+    assert_eq!(released.manifest, head_manifest);
     let dir_c = tmp.path().join("c");
-    pear_core::snapshot::clone_from_snapshot(&dir_c, &cloner, snapshots[0].id).unwrap();
+    pear_core::snapshot::clone_from_snapshot(&dir_c, &cloner, snapshots[1].id).unwrap();
     assert!(!dir_c.join("wip.txt").exists());
     assert_eq!(
         std::fs::read(dir_c.join("src/main.rs")).unwrap(),
         b"fn main() {}\n"
     );
+}
+
+/// §32 reader fallback, at the trigger: a device with only the Reader
+/// role converges into a typed `Forbidden`, which is what makes the
+/// converge loop log once and degrade to a read-only mirror instead of
+/// dying. A Writer on the same workspace converges normally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reader_converge_is_forbidden_not_fatal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let url = start_relay(&tmp.path().join("relay")).await;
+    wait_ready(&url).await;
+
+    let admin = RelayClient::unbound(&url, TOKEN, "operator");
+    let owner_tok = admin.create_user("owner").unwrap().token;
+    let rita_tok = admin.create_user("rita").unwrap().token;
+    let owner_admin = RelayClient::unbound(&url, &owner_tok, "owner-laptop");
+    let acme = owner_admin.create_team("acme").unwrap();
+    owner_admin
+        .team_add_member(&acme.id, "rita", "reader")
+        .unwrap();
+
+    // The owner converges a tree into a fresh team workspace.
+    let dir_a = tmp.path().join("a");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    write(&dir_a, "f.txt", b"v1\n");
+    let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
+    let owner = RelayClient::new(&url, &owner_tok, &meta.id, "owner-laptop");
+    owner.create_workspace_with_team("api", Some(&acme.id)).unwrap();
+    let report = pear_core::converge::converge_once(&dir_a, &owner, "owner-laptop", None).unwrap();
+    assert!(report.pushed);
+
+    // Rita reads the workspace fine, but converging it is Forbidden — the
+    // one error the loop answers by becoming a mirror.
+    let dir_r = tmp.path().join("rita");
+    std::fs::create_dir_all(&dir_r).unwrap();
+    pear_core::init_workspace(&dir_r, Some(&meta.id)).unwrap();
+    let rita = RelayClient::new(&url, &rita_tok, &meta.id, "rita-laptop");
+    assert!(rita.get_workspace().is_ok(), "a reader can read");
+    write(&dir_r, "rita.txt", b"reader edit\n");
+    let err = pear_core::converge::converge_once(&dir_r, &rita, "rita-laptop", None).unwrap_err();
+    assert!(
+        matches!(err, PushError::Forbidden(_)),
+        "a reader's converge must be Forbidden (§32 mirror fallback), got {err:?}"
+    );
+    // The converge got as far as MATERIALIZING the remote side before the
+    // relay refused her upload — a reader already ends up with the head
+    // on disk — and her own edit is untouched.
+    assert_eq!(std::fs::read(dir_r.join("f.txt")).unwrap(), b"v1\n");
+    assert_eq!(
+        std::fs::read(dir_r.join("rita.txt")).unwrap(),
+        b"reader edit\n"
+    );
+    // ...and the read-only loop she falls back to picks up from there:
+    // the next writer commit lands for her.
+    write(&dir_a, "f.txt", b"v2\n");
+    pear_core::converge::converge_once(&dir_a, &owner, "owner-laptop", None).unwrap();
+    assert!(pull_once(&dir_r, &rita).unwrap().changed);
+    assert_eq!(std::fs::read(dir_r.join("f.txt")).unwrap(), b"v2\n");
 }
 
 /// M4 end-to-end (§13): the onboarding flow against the real relay. Admin
@@ -339,7 +279,7 @@ async fn snapshot_clone_and_force_checkpoint() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn team_onboarding_flow() {
     let tmp = tempfile::tempdir().unwrap();
-    let url = start_relay(&tmp.path().join("relay"), 300).await;
+    let url = start_relay(&tmp.path().join("relay")).await;
 
     // 1. Operator (admin token): create the users. Tokens come back once.
     let admin = RelayClient::unbound(&url, TOKEN, "operator");
@@ -374,7 +314,6 @@ async fn team_onboarding_flow() {
     owner
         .create_workspace_with_team("api", Some(&acme.id))
         .unwrap();
-    owner.acquire().unwrap();
     let pushed = push_cycle(&dir_a, &owner, 0, false).unwrap();
     assert_eq!(pushed.head_seq, 1);
 
@@ -404,7 +343,7 @@ async fn team_onboarding_flow() {
     let pulled = pull_once(&dir_r, &rita).unwrap();
     assert!(pulled.changed);
     assert_eq!(tree(&dir_a), tree(&dir_r));
-    // ...but cannot push: chunks, lease, and snapshots are all 403.
+    // ...but cannot push: chunks, head, and snapshots are all 403.
     let data = b"reader write attempt";
     let hash = blake3::hash(data).to_hex().to_string();
     let err = rita.put_chunk(&hash, data).unwrap_err();
@@ -412,14 +351,14 @@ async fn team_onboarding_flow() {
         matches!(err, RelayError::Http { status: 403, .. }),
         "reader put_chunk: {err:?}"
     );
-    let err = rita.acquire().unwrap_err();
-    assert!(
-        matches!(err, RelayError::Http { status: 403, .. }),
-        "reader acquire: {err:?}"
-    );
     let manifest = pear_core::manifest::load(&dir_r.join(".pear/manifest.json"))
         .unwrap()
         .unwrap();
+    let err = rita.put_head(1, &manifest).unwrap_err();
+    assert!(
+        matches!(err, RelayError::Http { status: 403, .. }),
+        "reader put_head: {err:?}"
+    );
     let err = rita.create_snapshot(None, &manifest).unwrap_err();
     assert!(
         matches!(err, RelayError::Http { status: 403, .. }),
@@ -447,7 +386,7 @@ async fn team_onboarding_flow() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_mirror_converges_on_head_changed() {
     let tmp = tempfile::tempdir().unwrap();
-    let url = start_relay(&tmp.path().join("relay"), 300).await;
+    let url = start_relay(&tmp.path().join("relay")).await;
 
     let dir_a = tmp.path().join("a");
     std::fs::create_dir_all(&dir_a).unwrap();
@@ -456,7 +395,6 @@ async fn ws_mirror_converges_on_head_changed() {
     let writer = RelayClient::new(&url, TOKEN, &meta.id, "device-a");
     wait_ready(&url).await;
     writer.create_workspace("a").unwrap();
-    writer.acquire().unwrap();
     let pushed = push_cycle(&dir_a, &writer, 0, false).unwrap();
     assert_eq!(pushed.head_seq, 1);
 
@@ -513,7 +451,7 @@ async fn ws_mirror_converges_on_head_changed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_mirror_connecting_after_a_commit_converges_via_head_now() {
     let tmp = tempfile::tempdir().unwrap();
-    let url = start_relay(&tmp.path().join("relay"), 300).await;
+    let url = start_relay(&tmp.path().join("relay")).await;
 
     let dir_a = tmp.path().join("a");
     std::fs::create_dir_all(&dir_a).unwrap();
@@ -522,7 +460,6 @@ async fn ws_mirror_connecting_after_a_commit_converges_via_head_now() {
     let writer = RelayClient::new(&url, TOKEN, &meta.id, "device-a");
     wait_ready(&url).await;
     writer.create_workspace("a").unwrap();
-    writer.acquire().unwrap();
 
     // Commit FIRST: nobody is subscribed yet, so no head_changed hint
     // could ever reach the mirror below.
@@ -613,14 +550,13 @@ fn generate_test_cert() -> Option<TestCert> {
 /// `https://` base URL.
 async fn start_relay_tls(
     data_dir: &Path,
-    lease_ttl_secs: u64,
     tls: pear_relay::ServerTls,
 ) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let dir = data_dir.to_path_buf();
     tokio::spawn(async move {
-        pear_relay::serve_on_tls(listener, TOKEN, &dir, lease_ttl_secs, tls)
+        pear_relay::serve_on_tls(listener, TOKEN, &dir, tls)
             .await
             .expect("relay TLS serve failed");
     });
@@ -649,7 +585,7 @@ async fn wait_ready_tls(url: &str, ca_pem: &[u8]) {
 }
 
 /// §17: the full writer/mirror round trip over HTTPS — workspace create,
-/// lease, chunks and head — with `--tls-ca-cert` trusting the relay's
+/// chunks and head — with `--tls-ca-cert` trusting the relay's
 /// self-signed cert.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn https_round_trip_with_private_ca() {
@@ -657,7 +593,7 @@ async fn https_round_trip_with_private_ca() {
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
-    let url = start_relay_tls(&tmp.path().join("relay"), 300, cert.server_tls()).await;
+    let url = start_relay_tls(&tmp.path().join("relay"), cert.server_tls()).await;
 
     let dir_a = tmp.path().join("a");
     std::fs::create_dir_all(&dir_a).unwrap();
@@ -668,7 +604,6 @@ async fn https_round_trip_with_private_ca() {
     let writer =
         RelayClient::with_tls_ca(&url, TOKEN, &meta.id, "device-a", Some(&cert.cert_pem)).unwrap();
     writer.create_workspace("a").unwrap();
-    writer.acquire().unwrap();
     let pushed = push_cycle(&dir_a, &writer, 0, false).unwrap();
     assert_eq!(pushed.head_seq, 1);
 
@@ -689,7 +624,7 @@ async fn https_client_without_ca_fails_verification() {
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
-    let url = start_relay_tls(&tmp.path().join("relay"), 300, cert.server_tls()).await;
+    let url = start_relay_tls(&tmp.path().join("relay"), cert.server_tls()).await;
     // Prove the failure below is verification, not a dead server.
     wait_ready_tls(&url, &cert.cert_pem).await;
 
@@ -718,7 +653,7 @@ async fn wss_head_changed_over_tls() {
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
-    let url = start_relay_tls(&tmp.path().join("relay"), 300, cert.server_tls()).await;
+    let url = start_relay_tls(&tmp.path().join("relay"), cert.server_tls()).await;
 
     let dir_a = tmp.path().join("a");
     std::fs::create_dir_all(&dir_a).unwrap();
@@ -728,7 +663,6 @@ async fn wss_head_changed_over_tls() {
     let writer =
         RelayClient::with_tls_ca(&url, TOKEN, &meta.id, "device-a", Some(&cert.cert_pem)).unwrap();
     writer.create_workspace("a").unwrap();
-    writer.acquire().unwrap();
     let pushed = push_cycle(&dir_a, &writer, 0, false).unwrap();
     assert_eq!(pushed.head_seq, 1);
 
@@ -838,7 +772,7 @@ fn assert_no_file_contains(dir: &Path, needle: &[u8]) {
 async fn e2e_push_pull_converges_and_relay_sees_only_ciphertext() {
     let tmp = tempfile::tempdir().unwrap();
     let relay_dir = tmp.path().join("relay");
-    let url = start_relay(&relay_dir, 300).await;
+    let url = start_relay(&relay_dir).await;
 
     // Writer dir A, with the canary in .env and two identical files
     // (convergent encryption must dedupe them).
@@ -854,7 +788,6 @@ async fn e2e_push_pull_converges_and_relay_sees_only_ciphertext() {
     wait_ready(&url).await;
     writer.create_workspace_e2e("a", None).unwrap();
     assert!(writer.get_workspace().unwrap().e2e, "registered as e2e");
-    writer.acquire().unwrap();
 
     // The workspace keyring lives at .pear/workspace_keys, 0600.
     let keyring = pear_core::e2e::load_or_create_workspace_keyring(&dir_a).unwrap();
@@ -967,7 +900,7 @@ async fn e2e_push_pull_converges_and_relay_sees_only_ciphertext() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_onboarding_flow_with_keys() {
     let tmp = tempfile::tempdir().unwrap();
-    let url = start_relay(&tmp.path().join("relay"), 300).await;
+    let url = start_relay(&tmp.path().join("relay")).await;
     // The writer's identity pins (§19): one known_keys file per device,
     // here the writer laptop's.
     let known_keys = tmp.path().join("known_keys");
@@ -1013,12 +946,11 @@ async fn e2e_onboarding_flow_with_keys() {
     wait_ready(&url).await;
     let owner = RelayClient::new(&url, &owner_tok, &meta.id, "owner-laptop");
     owner.create_workspace_e2e("api", Some(&acme.id)).unwrap();
-    owner.acquire().unwrap();
     let keyring = pear_core::e2e::load_or_create_workspace_keyring(&dir_a).unwrap();
     let pushed = pear_core::sync::push_cycle_e2e(&dir_a, &owner, 0, false, &keyring).unwrap();
     assert_eq!(pushed.head_seq, 1);
 
-    // 4. Wrap-maintenance (what `pear watch --e2e` runs at startup): jane
+    // 4. Wrap-maintenance (what a converge loop runs at startup): jane
     // and rita have no keys yet, so only the owner is wrapped — and his
     // identity is pinned at first sight.
     let wrap = pear_core::e2e::wrap_maintenance(&owner, &keyring, &known_keys).unwrap();
@@ -1052,9 +984,9 @@ async fn e2e_onboarding_flow_with_keys() {
     let msg = format!("{err:#}");
     assert!(msg.contains("no key is wrapped"), "{msg}");
     assert!(msg.contains("pear user keygen"), "{msg}");
-    assert!(msg.contains("watch --relay --e2e"), "{msg}");
+    assert!(msg.contains("join --relay <url> --e2e"), "{msg}");
 
-    // 5. The writer's next watch start (or `pear share`) re-wraps: jane is
+    // 5. The writer's next converge start (or `pear share`) re-wraps: jane is
     // in (pinned at first sight), rita still has no key.
     let wrap = pear_core::e2e::wrap_maintenance(&owner, &keyring, &known_keys).unwrap();
     assert!(wrap.wrapped.contains(&"jane".to_string()));
@@ -1162,7 +1094,7 @@ fn put_bundle(client: &RelayClient, keys_dir: &Path, name: &str) {
 async fn e2e_tampered_ciphertext_chunk_is_rejected() {
     let tmp = tempfile::tempdir().unwrap();
     let relay_dir = tmp.path().join("relay");
-    let url = start_relay(&relay_dir, 300).await;
+    let url = start_relay(&relay_dir).await;
 
     let dir_a = tmp.path().join("a");
     std::fs::create_dir_all(&dir_a).unwrap();
@@ -1171,7 +1103,6 @@ async fn e2e_tampered_ciphertext_chunk_is_rejected() {
     let writer = RelayClient::new(&url, TOKEN, &meta.id, "device-a");
     wait_ready(&url).await;
     writer.create_workspace_e2e("a", None).unwrap();
-    writer.acquire().unwrap();
     let keyring = pear_core::e2e::load_or_create_workspace_keyring(&dir_a).unwrap();
     pear_core::sync::push_cycle_e2e(&dir_a, &writer, 0, false, &keyring).unwrap();
 
@@ -1211,7 +1142,7 @@ async fn e2e_tampered_ciphertext_chunk_is_rejected() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_hostile_manifest_fails_client_side_validation() {
     let tmp = tempfile::tempdir().unwrap();
-    let url = start_relay(&tmp.path().join("relay"), 300).await;
+    let url = start_relay(&tmp.path().join("relay")).await;
 
     let dir_a = tmp.path().join("a");
     std::fs::create_dir_all(&dir_a).unwrap();
@@ -1220,7 +1151,6 @@ async fn e2e_hostile_manifest_fails_client_side_validation() {
     let writer = RelayClient::new(&url, TOKEN, &meta.id, "device-a");
     wait_ready(&url).await;
     writer.create_workspace_e2e("a", None).unwrap();
-    writer.acquire().unwrap();
     let keyring = pear_core::e2e::load_or_create_workspace_keyring(&dir_a).unwrap();
     pear_core::sync::push_cycle_e2e(&dir_a, &writer, 0, false, &keyring).unwrap();
 
@@ -1299,7 +1229,7 @@ fn postdate_scan_cache(writer_dir: &Path) {
 async fn e2e_member_removal_rotates_and_cuts_off_future_content() {
     let tmp = tempfile::tempdir().unwrap();
     let relay_dir = tmp.path().join("relay");
-    let url = start_relay(&relay_dir, 300).await;
+    let url = start_relay(&relay_dir).await;
     // The writer's identity pins (§19), per-device as ever.
     let known_keys = tmp.path().join("known_keys");
 
@@ -1329,7 +1259,6 @@ async fn e2e_member_removal_rotates_and_cuts_off_future_content() {
     wait_ready(&url).await;
     let alice = RelayClient::new(&url, &alice_tok, &meta.id, "alice-laptop");
     alice.create_workspace_e2e("api", Some(&acme.id)).unwrap();
-    alice.acquire().unwrap();
     let mut keyring = pear_core::e2e::load_or_create_workspace_keyring(&dir_a).unwrap();
     assert_eq!(keyring.newest().0, 1, "a fresh workspace starts at generation 1");
     let pushed = pear_core::sync::push_cycle_e2e(&dir_a, &alice, 0, false, &keyring).unwrap();
@@ -1339,8 +1268,16 @@ async fn e2e_member_removal_rotates_and_cuts_off_future_content() {
     // The watch-start pass (§20): no record yet, so nothing rotates; alice
     // and bob are wrapped and the wrapped set is recorded.
     let pass =
-        pear_core::e2e::rotation_maintenance(&alice, &dir_a, &mut keyring, &known_keys, false)
-            .unwrap();
+        pear_core::e2e::rotation_maintenance(
+            &alice,
+            &dir_a,
+            &mut keyring,
+            &known_keys,
+            &alice_keys,
+            Some("alice"),
+            false,
+        )
+        .unwrap();
     assert!(!pass.rotated, "no record yet: the first pass never rotates");
     assert_eq!(keyring.newest().0, 1);
     let mut wrapped = pass.wrap.wrapped.clone();
@@ -1383,8 +1320,16 @@ async fn e2e_member_removal_rotates_and_cuts_off_future_content() {
     write(&dir_a, "edit.txt", b"v2 after bob left\n");
     postdate_scan_cache(&dir_a);
     let pass =
-        pear_core::e2e::rotation_maintenance(&alice, &dir_a, &mut keyring, &known_keys, false)
-            .unwrap();
+        pear_core::e2e::rotation_maintenance(
+            &alice,
+            &dir_a,
+            &mut keyring,
+            &known_keys,
+            &alice_keys,
+            Some("alice"),
+            false,
+        )
+        .unwrap();
     assert!(pass.rotated, "a vanished member rotates");
     assert_eq!(pass.departed, vec!["bob".to_string()]);
     assert_eq!(keyring.newest().0, 2);
@@ -1457,8 +1402,16 @@ async fn e2e_member_removal_rotates_and_cuts_off_future_content() {
         .team_add_member(&acme.id, "carol", "reader")
         .unwrap();
     let pass =
-        pear_core::e2e::rotation_maintenance(&alice, &dir_a, &mut keyring, &known_keys, false)
-            .unwrap();
+        pear_core::e2e::rotation_maintenance(
+            &alice,
+            &dir_a,
+            &mut keyring,
+            &known_keys,
+            &alice_keys,
+            Some("alice"),
+            false,
+        )
+        .unwrap();
     assert!(!pass.rotated, "a pure addition never rotates");
     assert_eq!(keyring.newest().0, 2);
     let mut wrapped = pass.wrap.wrapped.clone();
@@ -1487,5 +1440,180 @@ async fn e2e_member_removal_rotates_and_cuts_off_future_content() {
     assert_eq!(
         std::fs::read(dir_c.join("edit.txt")).unwrap(),
         b"v2 after bob left\n"
+    );
+}
+
+/// §32 merge-before-rotate: two writer devices of the SAME user fork the
+/// keyring's generation numbering — device A holds {1, 2a} while the
+/// relay's copy of alice's wrap holds {1, 2b, 3} — and A's next rotation
+/// must first union the relay's ring in (relay wins generation 2, gen 3
+/// is adopted) and only then mint generation 4. Without the merge A would
+/// mint 3 with a third key and strand the content sealed under the other
+/// branch's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rotation_merges_the_relays_wrapped_keyring_before_minting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let url = start_relay(&tmp.path().join("relay")).await;
+    // Pins are per-device: A and A2 keep their own (§19).
+    let known_keys = tmp.path().join("known_keys-a");
+    let known_keys_a2 = tmp.path().join("known_keys-a2");
+
+    let admin = RelayClient::unbound(&url, TOKEN, "operator");
+    let alice_tok = admin.create_user("alice").unwrap().token;
+    let bob_tok = admin.create_user("bob").unwrap().token;
+    let alice_keys = tmp.path().join("alice-keys");
+    let alice_admin = RelayClient::unbound(&url, &alice_tok, "alice-laptop");
+    put_bundle(&alice_admin, &alice_keys, "alice");
+    let bob_keys = tmp.path().join("bob-keys");
+    put_bundle(
+        &RelayClient::unbound(&url, &bob_tok, "bob-laptop"),
+        &bob_keys,
+        "bob",
+    );
+    let acme = alice_admin.create_team("acme").unwrap();
+    alice_admin
+        .team_add_member(&acme.id, "bob", "reader")
+        .unwrap();
+
+    // Device A: the e2e workspace at generation 1, wrapped to alice+bob.
+    let dir_a = tmp.path().join("a");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    write(&dir_a, "f.txt", b"v1\n");
+    let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
+    wait_ready(&url).await;
+    let alice = RelayClient::new(&url, &alice_tok, &meta.id, "alice-laptop");
+    alice.create_workspace_e2e("api", Some(&acme.id)).unwrap();
+    let mut ring_a = pear_core::e2e::load_or_create_workspace_keyring(&dir_a).unwrap();
+    pear_core::sync::push_cycle_e2e(&dir_a, &alice, 0, false, &ring_a).unwrap();
+    let pass = pear_core::e2e::rotation_maintenance(
+        &alice,
+        &dir_a,
+        &mut ring_a,
+        &known_keys,
+        &alice_keys,
+        Some("alice"),
+        false,
+    )
+    .unwrap();
+    assert!(!pass.rotated, "the first pass has no record to compare");
+
+    // Alice's SECOND device onboards from its wrap, rotates twice (say, a
+    // `pear rekey` and a member removal it saw), and re-wraps: the relay's
+    // copy of alice's ring is now {1, 2b, 3}.
+    let dir_a2 = tmp.path().join("a2");
+    let alice2 = RelayClient::new(&url, &alice_tok, &meta.id, "alice-desktop");
+    let mut ring_a2 =
+        pear_core::e2e::workspace_key_for_reader(&dir_a2, &alice2, &alice_keys, Some("alice"))
+            .unwrap();
+    assert_eq!(ring_a2.newest().0, 1, "A2 onboarded onto generation 1");
+    ring_a2.rotate();
+    let sealed_2b =
+        pear_core::crypto::encrypt_chunk(ring_a2.newest().1, b"sealed by A2 under generation 2");
+    ring_a2.rotate();
+    assert_eq!(ring_a2.newest().0, 3);
+    pear_core::e2e::wrap_maintenance(&alice2, &ring_a2, &known_keys_a2).unwrap();
+
+    // Device A never saw any of it and forks generation 2 with its own key.
+    ring_a.rotate();
+    let sealed_2a =
+        pear_core::crypto::encrypt_chunk(ring_a.newest().1, b"sealed by A under generation 2");
+    pear_core::e2e::store_workspace_keyring(&dir_a, &ring_a).unwrap();
+    assert_eq!(ring_a.newest().0, 2, "A's ring is {{1, 2a}}");
+
+    // Bob leaves, so A's next pass rotates — merging first.
+    alice_admin.team_remove_member(&acme.id, "bob").unwrap();
+    let pass = pear_core::e2e::rotation_maintenance(
+        &alice,
+        &dir_a,
+        &mut ring_a,
+        &known_keys,
+        &alice_keys,
+        Some("alice"),
+        false,
+    )
+    .unwrap();
+    assert!(pass.rotated);
+    assert_eq!(pass.departed, vec!["bob".to_string()]);
+    assert_eq!(
+        pass.merged_from_relay,
+        vec![2, 3],
+        "generation 2 replaced by the relay's, generation 3 adopted"
+    );
+    assert_eq!(pass.merge_skipped, None);
+    assert_eq!(
+        pass.generation, 4,
+        "the mint is max(known generation) + 1, not local-max + 1"
+    );
+    // The relay's branch of generation 2 is what A holds now; its own is
+    // gone (§32: the relay's copy is canonical).
+    assert!(
+        ring_a
+            .decrypt("chunk", |k| pear_core::crypto::decrypt_chunk(k, &sealed_2b))
+            .is_ok(),
+        "A adopted the relay's generation-2 key"
+    );
+    assert!(
+        ring_a
+            .decrypt("chunk", |k| pear_core::crypto::decrypt_chunk(k, &sealed_2a))
+            .is_err(),
+        "A's forked generation-2 key lost"
+    );
+    // The merged-then-rotated ring is what landed on disk, and what the
+    // relay now wraps for alice.
+    assert_eq!(
+        pear_core::e2e::load_workspace_keyring(&dir_a).unwrap(),
+        Some(ring_a.clone())
+    );
+    let wrapped_now =
+        pear_core::e2e::fetch_and_unwrap_workspace_key(&alice, &alice_keys, Some("alice")).unwrap();
+    assert_eq!(wrapped_now, ring_a);
+
+    // With no wrap on the relay yet (a first writer) — or no local
+    // identity to unwrap one with — the pass rotates the local ring and
+    // says so, rather than failing.
+    let dir_s = tmp.path().join("solo");
+    std::fs::create_dir_all(&dir_s).unwrap();
+    let (smeta, _) = pear_core::init_workspace(&dir_s, None).unwrap();
+    let solo = RelayClient::new(&url, &alice_tok, &smeta.id, "alice-laptop");
+    solo.create_workspace_e2e("solo", Some(&acme.id)).unwrap();
+    let mut ring_s = pear_core::e2e::load_or_create_workspace_keyring(&dir_s).unwrap();
+    let pass = pear_core::e2e::rotation_maintenance(
+        &solo,
+        &dir_s,
+        &mut ring_s,
+        &known_keys,
+        &alice_keys,
+        Some("alice"),
+        true,
+    )
+    .unwrap();
+    assert_eq!(pass.generation, 2, "the local ring rotated anyway");
+    assert!(pass.merged_from_relay.is_empty());
+    assert!(
+        pass.merge_skipped
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no keyring is wrapped"),
+        "{:?}",
+        pass.merge_skipped
+    );
+    let pass = pear_core::e2e::rotation_maintenance(
+        &solo,
+        &dir_s,
+        &mut ring_s,
+        &known_keys,
+        &alice_keys,
+        None,
+        true,
+    )
+    .unwrap();
+    assert_eq!(pass.generation, 3);
+    assert!(
+        pass.merge_skipped
+            .as_deref()
+            .unwrap_or_default()
+            .contains("--name"),
+        "{:?}",
+        pass.merge_skipped
     );
 }

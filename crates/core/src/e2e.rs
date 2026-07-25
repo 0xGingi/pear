@@ -17,9 +17,14 @@
 //! then caching the keyring 0600 for next time. §19 restricts who gets
 //! wrapped to: members whose signed key bundle verifies and matches the
 //! writer-side `known_keys` pin. §20's rotation-maintenance additionally
-//! compares the team against `.pear/wrapped_members.json` at watch start:
+//! compares the team against `.pear/wrapped_members.json` at loop start:
 //! a VANISHED member rotates the ring and loses their wrap row; a pure
-//! addition never rotates (new members receive the full history).
+//! addition never rotates (new members receive the full history). §32
+//! makes every writer device run that pass, so a rotation first MERGES
+//! the relay's copy of this device's own wrapped ring into the local one
+//! (relay wins a same-generation mismatch) and only then mints
+//! `max(generation) + 1` — concurrent writers extend one ring instead of
+//! forking a generation number.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -70,6 +75,35 @@ impl Keyring {
         let next = self.newest().0 + 1;
         self.keys.insert(next, rand::random());
         next
+    }
+
+    /// Union `other`'s generations into this ring (§32's merge-before-
+    /// rotate): a generation this ring LACKS is adopted, and on a
+    /// same-generation key MISMATCH `other` wins — the relay's wrapped
+    /// copy is canonical, so two devices that forked a generation
+    /// number converge on one key instead of stranding each other's
+    /// ciphertext. Returns the generations this ring gained or replaced,
+    /// ascending (empty = the rings already agreed).
+    pub fn union_from(&mut self, other: &Keyring) -> Vec<u32> {
+        let mut adopted = Vec::new();
+        for (gen, key) in &other.keys {
+            match self.keys.get_mut(gen) {
+                Some(mine) if mine == key => continue,
+                Some(mine) => {
+                    // A ring holds ONE key per generation, so the local
+                    // branch's key is dropped. §32 makes the relay's copy
+                    // canonical exactly so that every device drops the
+                    // same side of a forked generation.
+                    mine.zeroize();
+                    *mine = *key;
+                }
+                None => {
+                    self.keys.insert(*gen, *key);
+                }
+            }
+            adopted.push(*gen);
+        }
+        adopted
     }
 
     /// Run `attempt` against each generation, NEWEST first, returning the
@@ -255,7 +289,7 @@ pub fn workspace_key_for_reader(
 /// stored (the fork-clone stores it itself after init, so a refused clone
 /// keeps its no-side-effects guarantee). The failure modes are spelled
 /// out for the operator: a missing local identity says to `pear user
-/// keygen` first; a missing wrap says the writer must re-run watch/share
+/// keygen` first; a missing wrap says the writer must re-run join/share
 /// AFTER the user keygenned.
 pub fn fetch_and_unwrap_workspace_key(
     client: &RelayClient,
@@ -269,6 +303,22 @@ pub fn fetch_and_unwrap_workspace_key(
             client.workspace_id()
         )
     })?;
+    let keypair = local_user_keypair(keys_dir, name)?;
+    let blob_hex = client.get_my_wrapped_key().map_err(|e| match e {
+        RelayError::NotFound(_) => anyhow!(
+            "workspace {} is end-to-end encrypted but no key is wrapped for {name:?}: \
+             the writer must run `pear join --relay <url> --e2e` (or `pear share --team <team>`) again \
+             AFTER you registered your key with `pear user keygen --name {name}`",
+            client.workspace_id()
+        ),
+        other => anyhow::Error::new(other),
+    })?;
+    unwrap_keyring(&keypair, &blob_hex, name)
+}
+
+/// The local user keypair `name` lives under `keys_dir`, with the operator
+/// instruction spelled out when it does not.
+fn local_user_keypair(keys_dir: &Path, name: &str) -> Result<crypto::UserKeypair> {
     let secret = crypto::user_keypair_export(keys_dir, name).map_err(|e| {
         anyhow!(
             "no usable identity key for {name:?} in {} ({e:#}); \
@@ -276,21 +326,16 @@ pub fn fetch_and_unwrap_workspace_key(
             keys_dir.join(format!("{name}.x25519")).display()
         )
     })?;
-    let keypair = crypto::UserKeypair::from_secret_bytes(secret);
-    let blob_hex = client.get_my_wrapped_key().map_err(|e| match e {
-        RelayError::NotFound(_) => anyhow!(
-            "workspace {} is end-to-end encrypted but no key is wrapped for {name:?}: \
-             the writer must run `pear watch --relay --e2e` (or `pear share --team <team>`) again \
-             AFTER you registered your key with `pear user keygen --name {name}`",
-            client.workspace_id()
-        ),
-        other => anyhow::Error::new(other),
-    })?;
-    let blob = crypto::hex_decode(&blob_hex).context("wrapped key from the relay is not hex")?;
-    let mut payload = crypto::unwrap_key(&keypair, &blob).with_context(|| {
+    Ok(crypto::UserKeypair::from_secret_bytes(secret))
+}
+
+/// Unwrap one relay-served wrap blob into the keyring it carries.
+fn unwrap_keyring(keypair: &crypto::UserKeypair, blob_hex: &str, name: &str) -> Result<Keyring> {
+    let blob = crypto::hex_decode(blob_hex).context("wrapped key from the relay is not hex")?;
+    let mut payload = crypto::unwrap_key(keypair, &blob).with_context(|| {
         format!(
             "the wrapped key on the relay does not decrypt for {name:?} — the writer wrapped \
-             for a different (stale?) pubkey; ask them to run `pear watch --relay --e2e` again"
+             for a different (stale?) pubkey; ask them to run `pear join --relay <url> --e2e` again"
         )
     })?;
     // §20: the payload is the serialized keyring; a 32-byte payload is a
@@ -298,6 +343,43 @@ pub fn fetch_and_unwrap_workspace_key(
     let decoded = keyring_from_wrap_payload(&payload);
     payload.zeroize();
     decoded.context("the unwrapped payload is not a workspace keyring")
+}
+
+/// §32 merge-before-rotate: union the relay's copy of THIS user's wrapped
+/// keyring into `keyring`, so a rotation mints `max(known generation) + 1`
+/// rather than forking a generation number another device already used.
+/// Returns the generations adopted (see [`Keyring::union_from`]) or, as
+/// `Err` of the inner result, why the merge could not run at all — no
+/// local identity to unwrap with, or no wrap row on the relay yet (the
+/// first writer, or wraps not pushed). Both are ordinary states, so the
+/// caller proceeds with the local ring; a relay or crypto failure is a
+/// real error and propagates.
+fn merge_relay_keyring(
+    client: &RelayClient,
+    keyring: &mut Keyring,
+    keys_dir: &Path,
+    name: Option<&str>,
+) -> Result<Result<Vec<u32>, String>> {
+    let Some(name) = name else {
+        return Ok(Err(
+            "this device has no --name identity to unwrap its own wrapped keyring with".to_string(),
+        ));
+    };
+    let keypair = match local_user_keypair(keys_dir, name) {
+        Ok(keypair) => keypair,
+        Err(e) => return Ok(Err(format!("{e:#}"))),
+    };
+    let blob_hex = match client.get_my_wrapped_key() {
+        Ok(blob_hex) => blob_hex,
+        Err(RelayError::NotFound(_)) => {
+            return Ok(Err(format!(
+                "no keyring is wrapped for {name:?} on the relay yet"
+            )))
+        }
+        Err(e) => return Err(anyhow::Error::new(e)),
+    };
+    let relay_ring = unwrap_keyring(&keypair, &blob_hex, name)?;
+    Ok(Ok(keyring.union_from(&relay_ring)))
 }
 
 /// What a wrap-maintenance pass did (§17/§19).
@@ -388,7 +470,7 @@ fn classify_member(member: &crate::relay::MemberInfo, pins: &known_keys::KnownKe
     }
 }
 
-/// §17+§19+§20 writer wrap-maintenance, run at `pear watch --relay --e2e`
+/// §17+§19+§20 writer wrap-maintenance, run at `pear join --relay --e2e`
 /// startup and after `pear share`: every member of the workspace's
 /// attached team whose SIGNED key bundle verifies and matches the
 /// known_keys pin (`known_keys_path`) gets the keyring wrapped to them
@@ -577,12 +659,20 @@ pub struct RotationReport {
     pub rotated: bool,
     /// The keyring's generation after the pass.
     pub generation: u32,
+    /// §32 merge-before-rotate: generations this pass took from the
+    /// relay's copy of this user's wrapped ring before minting a new one
+    /// (gained, or replaced on a same-generation mismatch).
+    pub merged_from_relay: Vec<u32>,
+    /// Why merge-before-rotate did not run, when a rotation happened
+    /// without it (no local identity, no wrap row yet): the rotation used
+    /// the local ring alone.
+    pub merge_skipped: Option<String>,
     /// The ordinary §19 wrap pass over the (possibly rotated) keyring.
     pub wrap: WrapReport,
 }
 
-/// §20 rotation-maintenance, run at `pear watch --e2e` startup AFTER the
-/// lease is owned and BEFORE the first push — and, with `force`, by
+/// §20 rotation-maintenance, run at converge-loop startup BEFORE the
+/// first converge — and, with `force`, by
 /// `pear rekey` (the operator-initiated compromise response). The pass
 /// compares the attached team's current members against
 /// `.pear/wrapped_members.json`: any member who VANISHED since the last
@@ -592,16 +682,29 @@ pub struct RotationReport {
 /// at this generation while current members keep full history. A pure
 /// ADDITION never rotates: new members receive the whole ring.
 ///
-/// Between a removal and this pass nothing new can be pushed (only the
-/// writer pushes, and the writer runs this before its first push), so the
-/// removal window has no silent exposure. A workspace with no attached
-/// team has nobody to compare: nothing to do — unless `force`, which is
-/// an error (rotating with nobody to re-wrap would only orphan readers).
+/// §32: every writer device runs this at converge-loop startup, so two
+/// devices can race a rotation. Before a rotation mints anything, the
+/// device therefore MERGES first (`merge_relay_keyring`): it fetches its
+/// own wrapped ring from the relay, unions it in — the relay's copy wins
+/// a same-generation mismatch — persists the result, and only then mints
+/// `max(known generation) + 1`, so a device that missed a peer's rotation
+/// extends the ring instead of forking its newest generation number. With
+/// no wrap row on the relay yet (the first writer) or no `name` identity
+/// to unwrap with, the local ring rotates as before and the report says
+/// so. A workspace with no attached team has nobody to compare: nothing
+/// to do — unless `force`, which is an error (rotating with nobody to
+/// re-wrap would only orphan readers).
+///
+/// `keys_dir`/`name` are this device's local identity (`~/.pear/keys`,
+/// the `pear user keygen --name` name), the same pair
+/// `workspace_key_for_reader` unwraps with.
 pub fn rotation_maintenance(
     client: &RelayClient,
     root: &Path,
     keyring: &mut Keyring,
     known_keys_path: &Path,
+    keys_dir: &Path,
+    name: Option<&str>,
     force: bool,
 ) -> Result<RotationReport> {
     let Some(team_id) = client.get_workspace()?.team_id else {
@@ -615,6 +718,8 @@ pub fn rotation_maintenance(
             departed: Vec::new(),
             rotated: false,
             generation: keyring.newest().0,
+            merged_from_relay: Vec::new(),
+            merge_skipped: None,
             wrap: WrapReport::default(),
         });
     };
@@ -629,7 +734,25 @@ pub fn rotation_maintenance(
     // departure loses nothing and must not rotate.
     let departed: Vec<String> = last.difference(&current).cloned().collect();
     let rotated = force || !departed.is_empty();
+    let mut merged_from_relay = Vec::new();
+    let mut merge_skipped = None;
     if rotated {
+        // §32 merge-before-rotate: adopt every generation the relay's copy
+        // of our own wrap already knows, so the mint below lands above the
+        // newest generation ANY device has used, not just ours.
+        match merge_relay_keyring(client, keyring, keys_dir, name)? {
+            Ok(adopted) => {
+                if !adopted.is_empty() {
+                    // Persisted before the mint: a crash between here and
+                    // the rotation must not lose generations we just
+                    // learned about — content sealed under them would be
+                    // unreadable on this device.
+                    store_workspace_keyring(root, keyring)?;
+                    merged_from_relay = adopted;
+                }
+            }
+            Err(why) => merge_skipped = Some(why),
+        }
         keyring.rotate();
         // Persist the rotated ring BEFORE touching the relay: the wrap
         // rows are re-creatable, the new generation is not.
@@ -651,6 +774,8 @@ pub fn rotation_maintenance(
         departed,
         rotated,
         generation: keyring.newest().0,
+        merged_from_relay,
+        merge_skipped,
         wrap,
     })
 }
@@ -687,6 +812,55 @@ mod tests {
         let gen1_only = Keyring::from_legacy(first);
         let blob = crypto::encrypt_chunk(&third, b"post-removal content");
         assert!(gen1_only.decrypt("test blob", |k| crypto::decrypt_chunk(k, &blob)).is_err());
+    }
+
+    /// §32 merge-before-rotate, at the ring level: a union adopts the
+    /// generations the local ring lacks, the relay's key wins a
+    /// same-generation mismatch, and the rotation that follows mints
+    /// `max(known generation) + 1` — the concrete fork of §32, where the
+    /// local ring holds {1, 2a} and the relay's wrap holds {1, 2b, 3}.
+    #[test]
+    fn union_takes_missing_generations_and_the_relays_side_of_a_fork() {
+        let gen1: [u8; 32] = rand::random();
+        let gen2a: [u8; 32] = rand::random();
+        let gen2b: [u8; 32] = rand::random();
+        let gen3: [u8; 32] = rand::random();
+        let ring = |keys: &[(u32, [u8; 32])]| Keyring {
+            keys: keys.iter().copied().collect(),
+        };
+
+        // Identical rings union to nothing at all.
+        let mut local = ring(&[(1, gen1), (2, gen2a)]);
+        assert!(local.union_from(&ring(&[(1, gen1), (2, gen2a)])).is_empty());
+
+        // The fork: gen 3 is gained, gen 2 is REPLACED by the relay's key.
+        let adopted = local.union_from(&ring(&[(1, gen1), (2, gen2b), (3, gen3)]));
+        assert_eq!(adopted, vec![2, 3]);
+        assert_eq!(local, ring(&[(1, gen1), (2, gen2b), (3, gen3)]));
+        // Content sealed under the relay's generation 2 now opens; the
+        // local branch's key is gone.
+        let sealed_2b = crypto::encrypt_chunk(&gen2b, b"the relay's branch");
+        assert!(local
+            .decrypt("chunk", |k| crypto::decrypt_chunk(k, &sealed_2b))
+            .is_ok());
+        let sealed_2a = crypto::encrypt_chunk(&gen2a, b"our branch");
+        assert!(local
+            .decrypt("chunk", |k| crypto::decrypt_chunk(k, &sealed_2a))
+            .is_err());
+
+        // And the rotation after the merge mints max+1 = 4, not 3: the
+        // fork does not repeat.
+        assert_eq!(local.rotate(), 4);
+        assert_eq!(local.newest().0, 4);
+
+        // A union that only ADDS leaves the shared generations alone.
+        let mut behind = ring(&[(1, gen1)]);
+        assert_eq!(behind.union_from(&ring(&[(1, gen1), (2, gen2b)])), vec![2]);
+        assert_eq!(behind, ring(&[(1, gen1), (2, gen2b)]));
+        // A ring that is AHEAD keeps what the other side never had.
+        let mut ahead = ring(&[(1, gen1), (2, gen2b), (3, gen3)]);
+        assert!(ahead.union_from(&ring(&[(1, gen1)])).is_empty());
+        assert_eq!(ahead.newest().0, 3);
     }
 
     #[test]

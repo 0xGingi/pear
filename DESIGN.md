@@ -21,13 +21,17 @@ that should move is *state*.
    editor extensions) is *declared* in a manifest and rebuilt on each
    machine. Only unreproducible state — files you haven't committed, data
    you haven't exported — ever crosses the wire.
-2. **One writer at a time.** Every workspace has exactly one active writer,
-   enforced by a lease. No CRDTs, no OT, no live multi-writer merge. This is
-   the decision that keeps the hard distributed-systems problem out of the
-   product.
+2. **One head, serialized by CAS.** Every device writes; the relay's
+   compare-and-swap on the workspace head is the only concurrency control,
+   and a deterministic 3-way merge (base/local/remote) makes every device
+   converge to the byte-identical head. No CRDTs, no OT, no operational
+   transforms — just a total order on publications plus a merge that is a
+   pure function of its inputs, with last-writer-wins and a conflict copy
+   where two devices truly edited the same file. The lease that used to
+   enforce a single writer is retired; §32 is the contract.
 3. **Adopt, don't invent.** Nix flakes / devcontainer.json for environments,
    S3 for chunk storage, git stays git. Our surface area is sync, snapshots,
-   and leasing — nothing else.
+   and merge — nothing else.
 4. **Local-first.** Everything works offline. Sync catches up when the
    network does.
 
@@ -35,9 +39,10 @@ that should move is *state*.
 
 - **Workspace** — a project directory under pear management. Has an ID,
   an owner, a content log, and a head. The unit of sync.
-- **Lease** — a single-writer token for a workspace, held by one device at a
-  time. Heartbeat-based, transferable, force-takable (with consequences, see
-  §5).
+- **Head** — the workspace's current manifest on the relay, at a
+  relay-assigned monotonic sequence. Advanced only by a compare-and-swap
+  against the sequence the writer merged against (§32). (Superseded the
+  **lease**, the pre-§32 single-writer token.)
 - **Snapshot** — an immutable, content-addressed point-in-time capture of a
   workspace's files plus metadata. The unit of history, sharing, and
   recovery.
@@ -51,7 +56,7 @@ that should move is *state*.
 | Thing | Behavior | Why |
 |---|---|---|
 | Worktree files (incl. uncommitted changes) | **Sync** | The core value. |
-| `.git/` (branches, stash, unpushed commits) | **Sync** | Single-writer makes this safe; applied last during updates (§5). |
+| `.git/` (branches, stash, unpushed commits) | **Sync** | Applied last during updates (§5); divergent refs resolve by §32's merge, with the losing side kept out of the repo (§32 as-built). |
 | `.env*` and local config | **Sync (deliberate default)** | "Environment follows me" includes secrets; encrypted in transit and at rest. Overridable in `pear.toml`. |
 | `node_modules/`, `target/`, `dist/`, build outputs | **Never sync** | Reproducible; respect `.gitignore` plus a built-in exclude list. |
 | Toolchain, packages, editor extensions | **Rebuild from manifest** | Declared, not synced. |
@@ -60,31 +65,21 @@ that should move is *state*.
 
 ## 5. Sync and conflict model
 
-### Lease lifecycle
+### Writer model and conflict policy
 
-- The device holding the lease is the **writer**; all other devices are
-  **read-only mirrors** that apply the writer's changes as they arrive.
-- `pear checkout <workspace>` on device B: B must be synced to head, then
-  the server transfers the lease. A's final state is checkpointed as a
-  snapshot first. A becomes a mirror.
-- Writer goes offline mid-work: mirrors keep their last-consistent state.
-  Another device can `pear checkout --force`. The old writer's lease is
-  revoked; if it later reconnects with unsynced changes, those become a
-  **divergent snapshot** the user can diff and restore from manually. Forks
-  are explicit, never silently merged.
-- Lease heartbeats (30s) keep a crashed laptop from holding a workspace
-  hostage; expiry is 5 minutes.
+**See §32** — it is the authoritative contract and replaces this section's
+original lease lifecycle and its "no file-level conflicts by construction"
+claim. In one paragraph: every device with the Writer role runs the same
+bidirectional converge loop (local events, head hints, poll); the relay's
+head CAS serializes publications; a deterministic 3-way merge over
+(base = last converged manifest, local = fresh scan, remote = head)
+decides each path — disjoint edits both land, edit beats delete, and a
+genuine same-file collision is last-writer-wins by mtime with the loser
+preserved as a conflict copy *before* the winner is written. Readers keep
+the read-only mirror loop below. There is no lease, no fencing, and no
+`pear checkout`.
 
-### Conflict policy
-
-There are no file-level conflicts by construction — only one writer exists.
-The failure modes are (a) force-takeover forks, handled as divergent
-snapshots above, and (b) partial application of a sync batch on a mirror,
-handled by staged application below. Dropbox's last-writer-wins-with-
-conflict-copies model is *not* used; for code and `.git`, silent conflict
-copies are worse than an explicit fork.
-
-### Apply protocol (mirrors)
+### Apply protocol (all devices)
 
 1. Stage incoming chunks into `.pear/staging/`.
 2. Apply as a batch: deletes → writes → renames, fsync, then update the
@@ -109,9 +104,11 @@ Both directions overridable per-workspace in `pear.toml`.
 - A snapshot = a manifest tree (path → chunk hashes, mode, mtime) + metadata:
   workspace ID, device, timestamp, message, manifest hash, git HEAD.
 - Two kinds: **named** (`pear snapshot -m "before refactor"`, kept
-  forever) and **checkpoints** (automatic: on lease release, on force
-  takeover, hourly while dirty; rolling retention — hourly for a day, daily
-  for a week).
+  forever) and **checkpoints** (automatic; rolling retention — hourly for a
+  day, daily for a week). As built, the one checkpoint trigger that ever
+  shipped was `lease/force`, so retiring leases (§32) left the retention
+  machinery with nothing firing into it; named snapshots are the live
+  escape hatch.
 
 ### Sharing
 
@@ -128,8 +125,8 @@ untouched.
    steps.
 2. **Bug repro** — "tests fail on my machine" → `pear snapshot` → link →
    teammate clones the *exact* state, unpushed branch and all.
-3. **Pairing / handoff** — lease transfer moves the live workspace to a
-   teammate's machine mid-problem.
+3. **Pairing** — both machines converge the same live workspace at once
+   (§32): edits flow both ways while the two of you work the problem.
 
 ## 7. Security model
 
@@ -151,14 +148,15 @@ sending each other proprietary code and `.env` files.
 ## 8. Architecture
 
 - **`peard`** — per-machine daemon: filesystem watcher (FSEvents /
-  inotify), debounce, chunker, sync client, lease holder, apply engine.
-  Plain directories on disk; **no FUSE, no virtual filesystem** — that path
-  is how sync products die.
-- **`pear`** — CLI control surface (`init`, `clone`, `checkout`,
-  `snapshot`, `share`, `status`, `log`).
-- **Relay server** — auth, user/team registry, lease coordination, snapshot
+  inotify), debounce, chunker, sync client, merge + converge loop, apply
+  engine. Plain directories on disk; **no FUSE, no virtual filesystem** —
+  that path is how sync products die.
+- **`pear`** — CLI control surface (`join`, `init`, `clone`, `snapshot`,
+  `share`, `status`, `log`).
+- **Relay server** — auth, user/team registry, head CAS (§32), snapshot
   metadata (Postgres), chunk store (S3-compatible). Sync events fan out to
-  mirrors over WebSocket; chunks flow device → S3 → mirrors, presigned.
+  every device over WebSocket; chunks flow device → S3 → devices,
+  presigned.
 - **Offline** — the daemon queues operations locally and pushes on
   reconnect; mirrors simply apply the backlog in order.
 - **Implementation** — Rust throughout: `peard`, `pear`, and the relay
@@ -167,20 +165,22 @@ sending each other proprietary code and `.env` files.
   reliability at scale, daemon memory footprint, static-binary
   distribution, and native-speed chunking/hashing.
 
-Rough sync flow: watcher fires → debounce (500ms) → chunk new/changed files
-→ upload missing chunks → commit new manifest as head → server notifies
-mirrors → mirrors stage and apply per §5.
+Rough sync flow: watcher fires (or a head hint arrives) → debounce (500ms)
+→ chunk new/changed files → upload missing chunks → 3-way merge against the
+head → CAS-commit the merged manifest as the new head → server notifies the
+other devices → they stage and apply per §5.
 
 ## 9. MVP scope
 
-**In:** `init` + continuous file sync on one device; multi-device mirrors +
-lease handoff; named snapshots; `share`/`clone`; macOS + Linux (both
-verified: full suite green on APFS and on x86_64 Linux); single-tenant
+**In:** `init` + continuous file sync on one device; multi-device
+read-only mirrors; live multi-writer collab (moved in by §32: CAS +
+deterministic 3-way merge); named snapshots; `share`/`clone`; macOS + Linux
+(both verified: full suite green on APFS and on x86_64 Linux); single-tenant
 cloud hosted by us.
 
-**Out (explicit non-goals for v1):** live multi-writer collab, FUSE/virtual
-files, process checkpointing, database state providers, GUI, Windows, full
-E2E, self-hosting.
+**Out (explicit non-goals for v1):** FUSE/virtual files, process
+checkpointing, database state providers, GUI, Windows, full E2E,
+self-hosting.
 
 Milestones, in dependency order:
 
@@ -191,11 +191,16 @@ Milestones, in dependency order:
 
 ## 10. Risks and open questions
 
-- **`.git` sync edge cases.** Single-writer + apply-last + snapshots bounds
-  the damage, but the recovery UX (`git fsck` horror stories from Dropbox
-  users) needs real testing before teams trust it.
-- **Force-takeover forks.** The divergent-snapshot UX has to be excellent or
-  users will lose uncommitted work once and never trust the product again.
+- **`.git` sync edge cases.** Apply-last + snapshots bounds the damage, and
+  §29's real-git tests cover the recovery UX (`git fsck` horror stories from
+  Dropbox users). Under §32 both devices' objects survive and only refs
+  contend; the losing ref is kept OUT of the repo (§32 as-built), so `git
+  fsck --strict` stays clean and the losing commit is dangling-but-
+  recoverable.
+- **Divergent work.** Nothing is silently dropped: every losing side of a
+  concurrent edit is preserved as a conflict copy (§32), which must stay
+  obvious in the UX or users will lose uncommitted work once and never trust
+  the product again.
 - **`.env` sync-by-default.** Decided: stays. It *is* the product's promise;
   the mitigation for security teams is a per-team kill switch, not a
   different default.
@@ -238,6 +243,9 @@ Milestones, in dependency order:
   Server-held-keys workspaces remain supported as the non-E2E flavor.
 
 ## 11. M2 implementation contract
+
+*(Lease/handoff parts superseded by §32; §11–§31 are kept as the
+historical as-built record.)*
 
 M2 = multi-device mirrors + lease handoff (§9). Deliverables: `pear-relay`
 (server binary) and relay client flows in `pear-core` + `pear` CLI. The
@@ -1737,3 +1745,196 @@ not exist. This milestone removes it.
   of `<source>/.pear/store` is safe (nothing references it).
 - Verified: 319 passed + clippy clean at landing.
 
+
+## 32. Multi-writer contract (leases retired, CAS + 3-way merge)
+
+Status: authoritative. Supersedes §2 principle 2, §5's lease lifecycle,
+and §9's "live multi-writer collab" non-goal. Every device with the
+Writer role syncs continuously and concurrently; no leases, no fencing,
+no `checkout`, no manual commands after `pear join`.
+
+### Model
+
+- The relay's head CAS (`put_head` rejects `base_seq != current_seq`
+  with 409 `current_seq`) is the *only* concurrency control. It already
+  exists and is exact-equality; seqs are relay-assigned and monotonic,
+  so there is no ABA.
+- Every writer device runs one bidirectional **converge loop** driven by
+  three triggers, all funneling into the same `converge` step:
+  (a) local FS events (existing debounce: 500ms quiet / 2s cap),
+  (b) WS head hints (writers now subscribe to the feed too),
+  (c) poll fallback.
+
+### The converge step
+
+Inputs: `base` = `.pear/manifest.json` (last converged state), `local` =
+fresh scan of the tree, `remote` = current relay head manifest.
+
+1. Fetch remote head (seq + manifest; decrypt if e2e).
+2. Scan local tree (existing scan + chunk cache).
+3. **3-way merge** per path (see rules below) → `merged` manifest, an
+   apply-list (remote-won entries to materialize locally), and a
+   conflict-copy list.
+4. Write conflict copies, apply remote-won adds/changes/deletes via the
+   existing staged `apply` (worktree first, `.git` last — unchanged).
+5. If `merged` differs from `remote`: push chunks, then
+   `put_head(base_seq = remote.seq, merged)`. On 409, goto 1 (the merge
+   is re-run against the new head; the loop terminates because each 409
+   means another writer advanced the head, and merges are convergent).
+6. Commit point: write `merged` to `.pear/manifest.json` +
+   `remote.json` (seq/hash) — same atomicity as today.
+
+Deleting the lease system removes: relay lease routes + table +
+heartbeats, client generation/fencing headers, `X-Pear-Generation`,
+`EXIT_LOST_LEASE`, `pear checkout`, and the fencing block in `put_head`
+(role check `require_role(Writer)` and the CAS stay).
+
+### Merge rules (per path; "changed" = FileEntry inequality vs base)
+
+| base | local | remote | result |
+|---|---|---|---|
+| any | unchanged | unchanged | keep |
+| any | changed/added | unchanged | local |
+| any | unchanged | changed/added | remote (apply locally) |
+| exists | deleted | unchanged | delete (propagates) |
+| exists | unchanged | deleted | delete locally |
+| exists | deleted | changed | **remote** (edit beats delete; file restored) |
+| exists | changed | deleted | **local** (edit beats delete; re-pushed) |
+| any | changed/added | changed/added, equal content+mode | keep (mtime: newer) |
+| any | changed/added | changed/added, differs | **LWW**: newer (mtime_secs, mtime_nanos) wins the path; tie → remote wins. Loser becomes a conflict copy. |
+
+- Conflict copy name: `stem (conflict from <device> <YYYY-MM-DD HHMMSS>)[.ext]`
+  in the same directory — device = the *loser's* device where known
+  (local loser: our device name; remote loser: unknown → the relay has
+  no author metadata, use the winner's peer view: name it from our
+  device only when the local copy loses; when the remote copy loses,
+  suffix `(conflict from remote …)`). Conflict copies are ordinary
+  files: they sync to everyone and are never auto-deleted.
+  **As built, with one exception: paths whose first component is
+  `.git`.** A conflict copy inside a repository is not a valid
+  refname/object path — `git fsck --strict` reports `badRefName` — and
+  syncing one would break the repo on every device, against the
+  README's promise of fsck-clean repos. Such a copy therefore never
+  enters the merged manifest and never lands in the tree; the loser's
+  bytes are preserved LOCALLY at
+  `.pear/conflicts/<original path> (conflict from …)` (same name, same
+  collision numbering; parents created; `.pear` is 0700 and excluded
+  from manifests by validation, so these never sync). Each device
+  keeps only its own losing side — a local loser is copied from disk
+  before the winner overwrites it, a remote loser is assembled from
+  chunks — and the no-byte-loss invariant below is unchanged: the
+  winner is one intact lineage and the loser's commit stays
+  dangling-but-recoverable (`git fsck --lost-found`).
+- If a conflict-copy name already exists, append ` 2`, ` 3`, ….
+- Merge is deterministic given (base, local, remote), and CAS serializes
+  publications, so all devices converge to the byte-identical head.
+- No tombstones and no per-entry authorship are added: the 3-way merge
+  against the locally-stored base makes delete-vs-edit decidable
+  without them. `FileEntry` is unchanged.
+
+### Roles
+
+- Writer role ⇒ converge loop (bidirectional).
+- Reader role ⇒ existing mirror loop, unchanged (`pear mirror`,
+  `clone`). A reader's `join` degrades to mirror mode on first 403.
+
+### CLI surface
+
+- **`pear join <path> --relay R [--workspace ID] [--team] [--e2e]
+  [--token] [--device] [--name]`** — the one-time front door. Creates
+  the workspace (empty relay side ⇒ first converge publishes the tree;
+  `--workspace` into an empty dir ⇒ first converge materializes it,
+  replacing `clone`-then-watch). Registers with peard and **auto-starts
+  peard** (spawn detached on the unix socket being absent). After
+  `join`, everything is automatic: no watch, no checkout, ever.
+- `pear sync <path> --relay R …` — foreground converge loop (debug/CI).
+  The existing local `pear sync SRC DST` (positional target) is
+  untouched.
+- `pear watch SRC DST` (local mode) untouched. `pear watch --relay` and
+  `pear checkout` are **removed**.
+- `pear mirror`, `snapshot(s)`, `share`, `clone`, `rekey`, `trust`,
+  `status`, teams/users: unchanged.
+
+### E2E under multi-writer
+
+- Chunks stay ciphertext-addressed; cross-writer dedup of identical
+  plaintext does not exist (accepted; documented).
+- Rotation hazard (two devices concurrently minting generation n+1 with
+  different keys) is closed by **merge-before-rotate**: before any
+  rotation (loop startup on member removal, or `pear rekey`), the
+  device fetches its own wrapped keyring from the relay and takes the
+  union of generations, relay winning a same-generation mismatch; only
+  then does it mint `max(gen)+1`. If two devices still race, both
+  branches' wraps land on the relay and later unions carry both keys —
+  decrypt already walks newest→oldest across all held generations, so
+  content is never stranded. Removed members stay cut off (they get no
+  new wraps from either branch).
+
+### Durability & invariants (unchanged)
+
+- Staged apply order, group fsync, atomic manifest commit, chunk
+  verify-on-read, GC: all as-built (§18, §22, §24, §25).
+- Invariant: a converge never loses a byte of local user data — every
+  locally-modified file either wins its path or persists as a conflict
+  copy *before* the remote version is applied over it.
+- Invariant: `put_head` remains the only route that advances a head;
+  role-gated Writer + CAS, nothing else.
+
+### Verification (defines "finished")
+
+- Core unit tests: full merge-rule matrix (every row above), conflict
+  copy naming/dedup, determinism (merge(a) == merge(a)).
+- Relay tests: lease tests deleted; CAS conflict → client rebase
+  converges; two concurrent writers end byte-identical.
+- Integration (relay e2e tests): two writers editing disjoint files
+  converge with both edits; same file → LWW winner + conflict copy on
+  both devices; delete-vs-edit both directions; e2e-encrypted variant.
+- peard: join auto-start, converge loop supervision, restore.
+- Full suite green (`cargo test`), clippy clean, release build clean.
+
+### As-built (landed 2026-07-24, phases 1–3)
+
+- **Phase 1 — merge + converge.** `crates/core/src/merge.rs` (pure 3-way
+  merge: rule table, conflict naming/numbering, `conflict_stamp`, no
+  clock/FS/network) and `crates/core/src/converge.rs` (`converge_once`:
+  head fetch → scan+upload → merge → fetch-for-apply → materialize →
+  CAS publish, with a bounded 32-attempt re-merge on 409). Materialization
+  reuses the staged `apply` via `apply_commit`, which commits the remote
+  head — not `merged` — to `.pear/manifest.json` until the push lands.
+- **Phase 2 — leases retired, CLI, daemon.** Relay lease routes/table,
+  heartbeats, `X-Pear-Generation`, `EXIT_LOST_LEASE`, `pear checkout` and
+  `pear watch --relay` are deleted; `pear join` (auto-starting `peard`)
+  and `pear sync --relay` are the surface. `crates/cli/src/loops.rs`
+  carries the converge loop (FS events + WS head hints + poll).
+- **Phase 3 — merge-before-rotate and the `.git` rule.**
+  `e2e::rotation_maintenance` now takes `keys_dir`/`name`, fetches this
+  user's wrapped ring (`GET keys/me`), unions it into the local ring
+  (`Keyring::union_from`: missing generations adopted, relay wins a
+  same-generation mismatch), persists the merged ring, and only then mints
+  `max(generation) + 1`; `RotationReport` reports `merged_from_relay` and
+  `merge_skipped`. `.git` conflict copies became local-only (bullet
+  above), so `git fsck --strict` is clean on both devices after a
+  two-writer converge over a real repo.
+
+Deviations from the contract above, all deliberate:
+
+- `put_head` still REQUIRES the `X-Pear-Device` header. §32 only removed
+  fencing; the header is attribution (it names the committing device on
+  the head row) and stayed mandatory rather than becoming optional.
+- Reader demotion is client-side and typed: a 403 on the converge push
+  surfaces as `PushError::Forbidden`, and the loop prints one line and
+  finishes the run on the mirror path. The relay is unchanged — it simply
+  refuses the write.
+- `daemon.json` changed shape: `add_watch` is the LOCAL two-directory
+  watch only and relay work registers as `add_converge`. A pre-§32
+  `daemon.json` holding relay watches fails to load on the role field —
+  personal project, no migration: delete it and re-`join`.
+- `.git` conflict copies do not sync (see the conflict-copy bullet):
+  they live under `.pear/conflicts/` on the device that lost.
+- `pear rekey` gained `--name`: merge-before-rotate needs a local
+  identity to unwrap this user's wrap with. Without it (and on a
+  workspace with no wrap row yet) the pass rotates the local ring and
+  says so in its report, rather than failing.
+- E2E cross-writer dedup does not exist: chunks stay ciphertext-addressed
+  with per-workspace-generation keys, so two devices writing identical
+  plaintext upload two blobs. Accepted, as contracted.

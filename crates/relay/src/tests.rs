@@ -18,14 +18,14 @@ struct TestRelay {
     _data_dir: tempfile::TempDir,
 }
 
-async fn start_relay(lease_ttl_secs: u64) -> TestRelay {
-    start_relay_with(lease_ttl_secs, 60).await
+async fn start_relay() -> TestRelay {
+    start_relay_with(60).await
 }
 
 /// `start_relay` with a tunable WS role re-check interval (§14).
-async fn start_relay_with(lease_ttl_secs: u64, ws_recheck_secs: u64) -> TestRelay {
+async fn start_relay_with(ws_recheck_secs: u64) -> TestRelay {
     let data_dir = tempfile::tempdir().unwrap();
-    let state = AppState::new(TOKEN, data_dir.path(), lease_ttl_secs)
+    let state = AppState::new(TOKEN, data_dir.path())
         .unwrap()
         .with_ws_recheck_secs(ws_recheck_secs);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -130,50 +130,20 @@ async fn create_ws(relay: &TestRelay, id: &str) {
     assert_eq!(resp.status(), 201);
 }
 
-async fn acquire(relay: &TestRelay, ws: &str, device: &str) -> Value {
-    let resp = relay
-        .post(&format!("/v1/workspaces/{ws}/lease/acquire"))
-        .json(&json!({ "device_id": device }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    resp.json().await.unwrap()
-}
-
-async fn transfer(
-    relay: &TestRelay,
-    ws: &str,
-    device: &str,
-    generation: i64,
-    base_seq: i64,
-) -> reqwest::Response {
-    relay
-        .post(&format!("/v1/workspaces/{ws}/lease/transfer"))
-        .json(&json!({
-            "device_id": device,
-            "generation": generation,
-            "base_seq": base_seq,
-        }))
-        .send()
-        .await
-        .unwrap()
-}
-
 /// PUT /head with the raw manifest bytes preserved exactly as submitted.
+/// §32: no lease to acquire, no generation header — the device header is
+/// attribution and the CAS on `base_seq` is the whole contract.
 async fn put_head_raw(
     relay: &TestRelay,
     ws: &str,
     base_seq: i64,
     manifest_json: &str,
     device: &str,
-    generation: i64,
 ) -> reqwest::Response {
     relay
         .put(&format!("/v1/workspaces/{ws}/head"))
         .header("content-type", "application/json")
         .header("x-pear-device", device)
-        .header("x-pear-generation", generation.to_string())
         .body(format!(
             r#"{{"base_seq":{base_seq},"manifest":{manifest_json}}}"#
         ))
@@ -213,7 +183,7 @@ async fn upload_fixture_chunk(relay: &TestRelay, ws: &str) {
 
 #[tokio::test]
 async fn workspace_create_validates_id_and_name() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     for body in [
         json!({ "id": "", "name": "x" }),
         json!({ "id": "has/slash", "name": "x" }),
@@ -234,7 +204,7 @@ async fn workspace_create_validates_id_and_name() {
 
 #[tokio::test]
 async fn auth_required_on_all_routes() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     let url = format!("{}/v1/workspaces/ws-x", relay.base);
 
     let resp = relay.client.get(&url).send().await.unwrap();
@@ -260,7 +230,7 @@ async fn auth_required_on_all_routes() {
 
 #[tokio::test]
 async fn workspace_create_conflict_and_get() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
 
     let resp = relay
         .post("/v1/workspaces")
@@ -287,7 +257,6 @@ async fn workspace_create_conflict_and_get() {
     assert_eq!(body["name"], "demo");
     assert_eq!(body["head_seq"], Value::Null);
     assert_eq!(body["head_hash"], Value::Null);
-    assert_eq!(body["lease"], Value::Null);
 
     let resp = relay.get("/v1/workspaces/nope").send().await.unwrap();
     assert_eq!(resp.status(), 404);
@@ -295,7 +264,7 @@ async fn workspace_create_conflict_and_get() {
 
 #[tokio::test]
 async fn chunk_roundtrip_missing_check_and_hash_validation() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     create_ws(&relay, "ws-1").await;
 
     let data = b"hello relay";
@@ -393,7 +362,7 @@ async fn chunk_roundtrip_missing_check_and_hash_validation() {
 /// `open_deferred` and is a code-review fact, not an observable one.
 #[tokio::test]
 async fn chunk_routes_behave_identically_behind_the_deferred_pool() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     create_ws(&relay, "ws-1").await;
 
     let data = b"deferred pool roundtrip";
@@ -447,15 +416,13 @@ async fn chunk_routes_behave_identically_behind_the_deferred_pool() {
 /// the crate boundary from pear-core.
 #[tokio::test]
 async fn head_and_snapshot_commits_drain_the_deferred_pool_queue() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     create_ws(&relay, "ws-1").await;
 
     // One chunk PUT queues its fd in the deferred store (far below the
     // 64-pending self-flush threshold); the head commit must drain it.
     upload_fixture_chunk(&relay, "ws-1").await;
-    let lease = acquire(&relay, "ws-1", "dev").await;
-    let generation = lease["generation"].as_i64().unwrap();
-    let resp = put_head_raw(&relay, "ws-1", 0, &test_manifest("ws-1"), "dev", generation).await;
+    let resp = put_head_raw(&relay, "ws-1", 0, &test_manifest("ws-1"), "dev").await;
     assert_eq!(resp.status(), 200);
     assert_eq!(
         relay.state.store.pending_len(),
@@ -525,7 +492,7 @@ async fn post_put_many(relay: &TestRelay, token: &str, ws: &str, frame: Vec<u8>)
 
 #[tokio::test]
 async fn put_many_stores_dedupes_and_isolates_bad_entries() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     create_ws(&relay, "ws-1").await;
 
     // h_existing is already in the pool via a single PUT, so the batch
@@ -610,7 +577,7 @@ async fn put_many_stores_dedupes_and_isolates_bad_entries() {
 
 #[tokio::test]
 async fn put_many_enforces_the_entry_and_byte_caps() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     create_ws(&relay, "ws-1").await;
 
     // One entry over the 256-entry cap → 400 before anything is stored.
@@ -644,7 +611,7 @@ async fn put_many_enforces_the_entry_and_byte_caps() {
 
 #[tokio::test]
 async fn put_many_requires_the_writer_role() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     let alice = create_user(&relay, "alice").await;
     let bob = create_user(&relay, "bob").await;
     let carol = create_user(&relay, "carol").await;
@@ -671,7 +638,7 @@ async fn put_many_requires_the_writer_role() {
 
 #[tokio::test]
 async fn get_many_returns_request_order_and_enforces_visibility() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     let alice = create_user(&relay, "alice").await;
     let mallory = create_user(&relay, "mallory").await;
     create_ws_as(&relay, &alice, "ws-a2", "a", None).await;
@@ -766,8 +733,8 @@ async fn get_many_returns_request_order_and_enforces_visibility() {
 }
 
 #[tokio::test]
-async fn head_put_cas_fencing_and_verbatim_get() {
-    let relay = start_relay(300).await;
+async fn head_put_cas_and_verbatim_get() {
+    let relay = start_relay().await;
     create_ws(&relay, "ws-1").await;
     upload_fixture_chunk(&relay, "ws-1").await;
     let manifest = test_manifest("ws-1");
@@ -777,37 +744,41 @@ async fn head_put_cas_fencing_and_verbatim_get() {
     let resp = relay.get("/v1/workspaces/ws-1/head").send().await.unwrap();
     assert_eq!(resp.status(), 404);
 
-    // Head writes are fenced without a lease.
-    let resp = put_head_raw(&relay, "ws-1", 0, &manifest, "laptop-a", 1).await;
-    assert_eq!(resp.status(), 403, "no lease held");
-
-    let lease = acquire(&relay, "ws-1", "laptop-a").await;
-    assert_eq!(lease["generation"].as_i64().unwrap(), 1);
-
-    // First write commits at seq 1; hash = BLAKE3 of the exact manifest bytes.
-    let resp = put_head_raw(&relay, "ws-1", 0, &manifest, "laptop-a", 1).await;
+    // §32: no lease to hold — a Writer just commits. First write lands
+    // at seq 1; hash = BLAKE3 of the exact manifest bytes.
+    let resp = put_head_raw(&relay, "ws-1", 0, &manifest, "laptop-a").await;
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["seq"].as_i64().unwrap(), 1);
     assert_eq!(body["hash"].as_str().unwrap(), manifest_hash);
 
     // Stale base_seq is a CAS conflict carrying the current seq.
-    let resp = put_head_raw(&relay, "ws-1", 0, &manifest, "laptop-a", 1).await;
+    let resp = put_head_raw(&relay, "ws-1", 0, &manifest, "laptop-a").await;
     assert_eq!(resp.status(), 409);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body, json!({ "current_seq": 1 }));
 
-    // Fencing: wrong device, wrong generation.
-    let resp = put_head_raw(&relay, "ws-1", 1, &manifest, "laptop-b", 1).await;
-    assert_eq!(resp.status(), 403, "wrong device");
-    let resp = put_head_raw(&relay, "ws-1", 1, &manifest, "laptop-a", 99).await;
-    assert_eq!(resp.status(), 403, "stale generation");
-
-    // Correct base_seq advances the log.
-    let resp = put_head_raw(&relay, "ws-1", 1, &manifest, "laptop-a", 1).await;
-    assert_eq!(resp.status(), 200);
+    // §32: a SECOND device with the correct base_seq commits — the CAS
+    // is the only gate, and whoever gets there first wins.
+    let resp = put_head_raw(&relay, "ws-1", 1, &manifest, "laptop-b").await;
+    assert_eq!(resp.status(), 200, "any writer may advance the head");
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["seq"].as_i64().unwrap(), 2);
+    // ...and the loser of that race gets the CAS conflict, not a 403.
+    let resp = put_head_raw(&relay, "ws-1", 1, &manifest, "laptop-a").await;
+    assert_eq!(resp.status(), 409);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body, json!({ "current_seq": 2 }));
+
+    // The device header is still REQUIRED (attribution, §32).
+    let resp = relay
+        .put("/v1/workspaces/ws-1/head")
+        .header("content-type", "application/json")
+        .body(format!(r#"{{"base_seq":2,"manifest":{manifest}}}"#))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "missing X-Pear-Device");
 
     // GET /head returns the manifest bytes verbatim.
     let resp = relay.get("/v1/workspaces/ws-1/head").send().await.unwrap();
@@ -818,26 +789,24 @@ async fn head_put_cas_fencing_and_verbatim_get() {
     assert_eq!(body["seq"].as_i64().unwrap(), 2);
     assert_eq!(body["hash"].as_str().unwrap(), manifest_hash);
 
-    // The workspace read mirrors head and lease state.
+    // The workspace read mirrors head state (§32: no lease field).
     let resp = relay.get("/v1/workspaces/ws-1").send().await.unwrap();
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["head_seq"].as_i64().unwrap(), 2);
     assert_eq!(body["head_hash"].as_str().unwrap(), manifest_hash);
-    assert_eq!(body["lease"]["holder"], "laptop-a");
-    assert_eq!(body["lease"]["generation"].as_i64().unwrap(), 1);
+    assert!(body.get("lease").is_none(), "leases are retired (§32)");
 
     // Unknown workspace: 404 on both GET and PUT.
     let resp = relay.get("/v1/workspaces/nope/head").send().await.unwrap();
     assert_eq!(resp.status(), 404);
-    let resp = put_head_raw(&relay, "nope", 0, &manifest, "laptop-a", 1).await;
+    let resp = put_head_raw(&relay, "nope", 0, &manifest, "laptop-a").await;
     assert_eq!(resp.status(), 404);
 }
 
 #[tokio::test]
 async fn head_put_rejects_unsafe_and_malformed_manifests() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     create_ws(&relay, "ws-1").await;
-    acquire(&relay, "ws-1", "laptop-a").await;
 
     // Path traversal must never reach the head log.
     let evil = json!({
@@ -851,11 +820,11 @@ async fn head_put_rejects_unsafe_and_malformed_manifests() {
         }
     })
     .to_string();
-    let resp = put_head_raw(&relay, "ws-1", 0, &evil, "laptop-a", 1).await;
+    let resp = put_head_raw(&relay, "ws-1", 0, &evil, "laptop-a").await;
     assert_eq!(resp.status(), 400, "unsafe path");
 
     // Well-formed JSON, but not a pear manifest.
-    let resp = put_head_raw(&relay, "ws-1", 0, r#"{"files": 42}"#, "laptop-a", 1).await;
+    let resp = put_head_raw(&relay, "ws-1", 0, r#"{"files": 42}"#, "laptop-a").await;
     assert_eq!(resp.status(), 400, "not a manifest");
 
     // Malformed request JSON.
@@ -863,7 +832,6 @@ async fn head_put_rejects_unsafe_and_malformed_manifests() {
         .put("/v1/workspaces/ws-1/head")
         .header("content-type", "application/json")
         .header("x-pear-device", "laptop-a")
-        .header("x-pear-generation", "1")
         .body("{not json")
         .send()
         .await
@@ -875,7 +843,6 @@ async fn head_put_rejects_unsafe_and_malformed_manifests() {
         .put("/v1/workspaces/ws-1/head")
         .header("content-type", "application/json")
         .header("x-pear-device", "laptop-a")
-        .header("x-pear-generation", "1")
         .body(format!(r#"{{"manifest":{}}}"#, test_manifest("ws-1")))
         .send()
         .await
@@ -883,232 +850,14 @@ async fn head_put_rejects_unsafe_and_malformed_manifests() {
     assert_eq!(resp.status(), 400, "missing base_seq");
 }
 
-#[tokio::test]
-async fn lease_acquire_conflict_and_heartbeat() {
-    let relay = start_relay(300).await;
-    create_ws(&relay, "ws-1").await;
 
-    // Lease ops on an unknown workspace are 404.
-    let resp = relay
-        .post("/v1/workspaces/nope/lease/acquire")
-        .json(&json!({ "device_id": "laptop-a" }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 404);
 
-    let lease = acquire(&relay, "ws-1", "laptop-a").await;
-    assert_eq!(lease["generation"].as_i64().unwrap(), 1);
-    let expires_at = lease["expires_at"].as_i64().unwrap();
 
-    // A second device cannot take a held lease.
-    let resp = relay
-        .post("/v1/workspaces/ws-1/lease/acquire")
-        .json(&json!({ "device_id": "laptop-b" }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 409);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["holder"], "laptop-a");
-    assert_eq!(body["expires_at"].as_i64().unwrap(), expires_at);
 
-    // Re-acquire by the holder succeeds without a generation bump.
-    let lease = acquire(&relay, "ws-1", "laptop-a").await;
-    assert_eq!(lease["generation"].as_i64().unwrap(), 1);
-
-    // Heartbeat extends the lease.
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    let resp = relay
-        .post("/v1/workspaces/ws-1/lease/heartbeat")
-        .json(&json!({ "device_id": "laptop-a", "generation": 1 }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await.unwrap();
-    assert!(body["expires_at"].as_i64().unwrap() >= expires_at);
-
-    // Wrong holder or stale generation is fenced.
-    let resp = relay
-        .post("/v1/workspaces/ws-1/lease/heartbeat")
-        .json(&json!({ "device_id": "laptop-a", "generation": 99 }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 403, "stale generation");
-    let resp = relay
-        .post("/v1/workspaces/ws-1/lease/heartbeat")
-        .json(&json!({ "device_id": "laptop-b", "generation": 1 }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 403, "not the holder");
-}
-
-#[tokio::test]
-async fn lease_expiry_allows_steal_and_fences_old_writer() {
-    let relay = start_relay(1).await;
-    create_ws(&relay, "ws-1").await;
-    let lease = acquire(&relay, "ws-1", "laptop-a").await;
-    assert_eq!(lease["generation"].as_i64().unwrap(), 1);
-
-    // Whole-second expiry granularity: 1.2s always crosses a 1s TTL.
-    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-
-    // Expired lease: a steal succeeds and bumps the generation.
-    let lease = acquire(&relay, "ws-1", "laptop-b").await;
-    assert_eq!(
-        lease["generation"].as_i64().unwrap(),
-        2,
-        "steal bumps generation"
-    );
-
-    // The old writer is fenced: heartbeat and head writes fail.
-    let resp = relay
-        .post("/v1/workspaces/ws-1/lease/heartbeat")
-        .json(&json!({ "device_id": "laptop-a", "generation": 1 }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 403);
-    let resp = put_head_raw(&relay, "ws-1", 0, &test_manifest("ws-1"), "laptop-a", 1).await;
-    assert_eq!(resp.status(), 403);
-
-    // Keep laptop-b's lease fresh for the still-valid assertion below —
-    // under load, the 1s TTL could otherwise lapse mid-test.
-    let resp = relay
-        .post("/v1/workspaces/ws-1/lease/heartbeat")
-        .json(&json!({ "device_id": "laptop-b", "generation": 2 }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-
-    // The new holder now holds a valid lease.
-    let resp = relay
-        .post("/v1/workspaces/ws-1/lease/acquire")
-        .json(&json!({ "device_id": "laptop-a" }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 409);
-}
-
-#[tokio::test]
-async fn lease_transfer_requires_synced_requester_and_expired_or_own_lease() {
-    let relay = start_relay(300).await;
-    create_ws(&relay, "ws-1").await;
-    upload_fixture_chunk(&relay, "ws-1").await;
-    acquire(&relay, "ws-1", "laptop-a").await;
-    let resp = put_head_raw(&relay, "ws-1", 0, &test_manifest("ws-1"), "laptop-a", 1).await;
-    assert_eq!(resp.status(), 200, "head at seq 1");
-
-    // Not synced to head.
-    let resp = transfer(&relay, "ws-1", "laptop-b", 1, 0).await;
-    assert_eq!(resp.status(), 409, "requester behind head");
-
-    // Synced, but the lease is valid and held by another device.
-    let resp = transfer(&relay, "ws-1", "laptop-b", 1, 1).await;
-    assert_eq!(resp.status(), 409, "valid lease held by another device");
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["holder"], "laptop-a");
-
-    // Transfer to the current holder succeeds and keeps the generation.
-    let resp = transfer(&relay, "ws-1", "laptop-a", 1, 1).await;
-    assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["generation"].as_i64().unwrap(), 1);
-}
-
-#[tokio::test]
-async fn lease_transfer_after_expiry_bumps_generation_and_fences() {
-    let relay = start_relay(1).await;
-    create_ws(&relay, "ws-1").await;
-    upload_fixture_chunk(&relay, "ws-1").await;
-    acquire(&relay, "ws-1", "laptop-a").await;
-    let resp = put_head_raw(&relay, "ws-1", 0, &test_manifest("ws-1"), "laptop-a", 1).await;
-    assert_eq!(resp.status(), 200);
-
-    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-
-    // Synced requester + expired lease: transfer succeeds, generation bumps.
-    let resp = transfer(&relay, "ws-1", "laptop-b", 1, 1).await;
-    assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["generation"].as_i64().unwrap(), 2);
-
-    // The old writer is fenced out of head writes...
-    let resp = put_head_raw(&relay, "ws-1", 1, &test_manifest("ws-1"), "laptop-a", 1).await;
-    assert_eq!(resp.status(), 403);
-
-    // Keep laptop-b's lease fresh for the write below (1s TTL, slow CI).
-    let resp = relay
-        .post("/v1/workspaces/ws-1/lease/heartbeat")
-        .json(&json!({ "device_id": "laptop-b", "generation": 2 }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-
-    // ...and the new holder writes at seq 2.
-    let resp = put_head_raw(&relay, "ws-1", 1, &test_manifest("ws-1"), "laptop-b", 2).await;
-    assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["seq"].as_i64().unwrap(), 2);
-}
-
-#[tokio::test]
-async fn lease_force_always_succeeds_and_bumps_generation() {
-    let relay = start_relay(300).await;
-    create_ws(&relay, "ws-1").await;
-
-    // Force with no lease at all starts at generation 1.
-    let resp = relay
-        .post("/v1/workspaces/ws-1/lease/force")
-        .json(&json!({ "device_id": "laptop-a" }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["generation"].as_i64().unwrap(), 1);
-
-    // Force over a valid lease held by another device.
-    let resp = relay
-        .post("/v1/workspaces/ws-1/lease/force")
-        .json(&json!({ "device_id": "laptop-b" }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["generation"].as_i64().unwrap(), 2);
-
-    // The revoked writer's heartbeat is fenced.
-    let resp = relay
-        .post("/v1/workspaces/ws-1/lease/heartbeat")
-        .json(&json!({ "device_id": "laptop-a", "generation": 1 }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 403);
-
-    // Force again bumps even for the current holder.
-    let resp = relay
-        .post("/v1/workspaces/ws-1/lease/force")
-        .json(&json!({ "device_id": "laptop-b" }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["generation"].as_i64().unwrap(), 3);
-}
 
 #[tokio::test]
 async fn chunk_put_rejects_body_that_does_not_hash_to_its_name() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     create_ws(&relay, "ws-verify").await;
 
     // Correct body for its hash: accepted.
@@ -1141,7 +890,7 @@ async fn chunk_put_rejects_body_that_does_not_hash_to_its_name() {
 
 #[tokio::test]
 async fn chunk_put_enforces_the_max_chunk_size() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     create_ws(&relay, "ws-size").await;
 
     // Exactly the chunker maximum: accepted.
@@ -1177,23 +926,13 @@ async fn chunk_put_enforces_the_max_chunk_size() {
 
 #[tokio::test]
 async fn head_put_rejects_manifest_of_another_workspace() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     create_ws(&relay, "ws-a").await;
-    let resp = relay
-        .post("/v1/workspaces/ws-a/lease/acquire")
-        .json(&json!({ "device_id": "laptop-a" }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await.unwrap();
-    let generation = body["generation"].clone();
 
     // A head whose manifest belongs to ws-b, committed under ws-a: 400.
     let resp = relay
         .put("/v1/workspaces/ws-a/head")
         .header("x-pear-device", "laptop-a")
-        .header("x-pear-generation", generation.to_string())
         .json(&json!({
             "base_seq": 0,
             "manifest": serde_json::from_str::<Value>(&test_manifest("ws-b")).unwrap(),
@@ -1279,7 +1018,7 @@ fn empty_token_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     // An empty token would authorize `Authorization: Bearer ` (empty
     // credential) for every request — refuse to start at all.
-    let err = crate::AppState::new("", dir.path(), 300)
+    let err = crate::AppState::new("", dir.path())
         .err()
         .expect("an empty token must be rejected");
     assert!(format!("{err:#}").contains("empty"));
@@ -1287,7 +1026,7 @@ fn empty_token_is_rejected() {
 
 #[tokio::test]
 async fn chunks_are_only_visible_to_readers_of_referencing_workspaces() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     let alice = create_user(&relay, "alice").await;
     let mallory = create_user(&relay, "mallory").await;
 
@@ -1301,8 +1040,7 @@ async fn chunks_are_only_visible_to_readers_of_referencing_workspaces() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    acquire(&relay, "ws-a", "laptop-a").await;
-    let resp = put_head_raw(&relay, "ws-a", 0, &test_manifest("ws-a"), "laptop-a", 1).await;
+    let resp = put_head_raw(&relay, "ws-a", 0, &test_manifest("ws-a"), "laptop-a").await;
     assert_eq!(resp.status(), 200);
 
     // Mallory self-provisions a workspace: the pool stays global, but
@@ -1344,8 +1082,7 @@ async fn chunks_are_only_visible_to_readers_of_referencing_workspaces() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    acquire(&relay, "ws-m", "laptop-m").await;
-    let resp = put_head_raw(&relay, "ws-m", 0, &test_manifest("ws-m"), "laptop-m", 1).await;
+    let resp = put_head_raw(&relay, "ws-m", 0, &test_manifest("ws-m"), "laptop-m").await;
     assert_eq!(resp.status(), 200);
     let resp = relay
         .get_as(&mallory, &format!("/v1/workspaces/ws-m/chunks/{chunk}"))
@@ -1357,7 +1094,7 @@ async fn chunks_are_only_visible_to_readers_of_referencing_workspaces() {
 
 #[tokio::test]
 async fn snapshot_cannot_reference_chunks_the_caller_cannot_see() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     let alice = create_user(&relay, "alice").await;
     let mallory = create_user(&relay, "mallory").await;
 
@@ -1370,15 +1107,13 @@ async fn snapshot_cannot_reference_chunks_the_caller_cannot_see() {
         .send()
         .await
         .unwrap();
-    acquire(&relay, "ws-a", "laptop-a").await;
-    let resp = put_head_raw(&relay, "ws-a", 0, &test_manifest("ws-a"), "laptop-a", 1).await;
+    let resp = put_head_raw(&relay, "ws-a", 0, &test_manifest("ws-a"), "laptop-a").await;
     assert_eq!(resp.status(), 200);
 
     // Mallory cannot snapshot a manifest referencing alice's chunk, and
     // the response is the same 400 as for a chunk that does not exist at
     // all: no cross-tenant presence oracle via the validation boundary.
     create_ws_as(&relay, &mallory, "ws-m", "m", None).await;
-    acquire(&relay, "ws-m", "laptop-m").await;
     for hash in [chunk.clone(), chunk_hash(b"never existed")] {
         let mut manifest: Value = serde_json::from_str(&test_manifest("ws-m")).unwrap();
         manifest["files"]["src/main.rs"]["chunks"] = json!([hash]);
@@ -1423,7 +1158,7 @@ async fn snapshot_cannot_reference_chunks_the_caller_cannot_see() {
 
 #[tokio::test]
 async fn user_tokens_are_stored_as_digests_only() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     let jane_token = create_user(&relay, "jane").await;
     let db = crate::db::Db::open(&relay._data_dir.path().join("relay.db")).unwrap();
     let stored = db.user_token_digests().unwrap();
@@ -1435,7 +1170,7 @@ async fn user_tokens_are_stored_as_digests_only() {
 
 #[tokio::test]
 async fn workspace_conflicts_carry_a_machine_kind() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     let owner = create_user(&relay, "owner").await;
     let team = create_team(&relay, &owner, "acme").await;
     create_ws_as(&relay, &owner, "ws-1", "api", Some(&team)).await;
@@ -1465,7 +1200,7 @@ async fn workspace_conflicts_carry_a_machine_kind() {
 
 #[tokio::test]
 async fn id_conflict_is_hidden_from_users_without_a_role() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     let alice = create_user(&relay, "alice").await;
     let mallory = create_user(&relay, "mallory").await;
     create_ws_as(&relay, &alice, "ws-secret", "s", None).await;
@@ -1494,7 +1229,7 @@ async fn id_conflict_is_hidden_from_users_without_a_role() {
 
 #[tokio::test]
 async fn last_owner_cannot_demote_themselves() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     let alice = create_user(&relay, "alice").await;
     let _bob = create_user(&relay, "bob").await;
     let team = create_team(&relay, &alice, "acme").await;
@@ -1522,7 +1257,7 @@ async fn last_owner_cannot_demote_themselves() {
 
 #[tokio::test]
 async fn snapshot_create_list_get_roundtrip() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     create_ws(&relay, "ws-1").await;
     upload_fixture_chunk(&relay, "ws-1").await;
     let manifest = test_manifest("ws-1");
@@ -1600,7 +1335,7 @@ async fn snapshot_create_list_get_roundtrip() {
 
 #[tokio::test]
 async fn snapshot_create_validation_failures() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     create_ws(&relay, "ws-1").await;
 
     // Unknown workspace: 404 on create, list, and get.
@@ -1675,127 +1410,7 @@ async fn snapshot_create_validation_failures() {
     assert_eq!(resp.status(), 400, "device is required");
 }
 
-#[tokio::test]
-async fn lease_force_checkpoints_the_overwritten_head() {
-    let relay = start_relay(300).await;
-    create_ws(&relay, "ws-1").await;
-    upload_fixture_chunk(&relay, "ws-1").await;
-    let manifest = test_manifest("ws-1");
 
-    // Force with no head: no checkpoint.
-    let resp = relay
-        .post("/v1/workspaces/ws-1/lease/force")
-        .json(&json!({ "device_id": "laptop-a" }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let resp = relay
-        .get("/v1/workspaces/ws-1/snapshots")
-        .send()
-        .await
-        .unwrap();
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(
-        body["snapshots"].as_array().unwrap().len(),
-        0,
-        "no head, no checkpoint"
-    );
-
-    // Commit a head, then force from another device: the old head is
-    // checkpointed first, credited to the outgoing holder (§12).
-    acquire(&relay, "ws-1", "laptop-a").await;
-    let resp = put_head_raw(&relay, "ws-1", 0, &manifest, "laptop-a", 1).await;
-    assert_eq!(resp.status(), 200);
-    let resp = relay
-        .post("/v1/workspaces/ws-1/lease/force")
-        .json(&json!({ "device_id": "laptop-b" }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-
-    let resp = relay
-        .get("/v1/workspaces/ws-1/snapshots")
-        .send()
-        .await
-        .unwrap();
-    let body: Value = resp.json().await.unwrap();
-    let list = body["snapshots"].as_array().unwrap();
-    assert_eq!(list.len(), 1);
-    assert_eq!(list[0]["id"].as_i64().unwrap(), 1);
-    assert_eq!(list[0]["kind"], "checkpoint");
-    assert_eq!(
-        list[0]["device"], "laptop-a",
-        "credited to the outgoing holder"
-    );
-    assert_eq!(list[0]["name"], Value::Null);
-
-    // The checkpoint's manifest is the overwritten head, verbatim.
-    let resp = relay
-        .get("/v1/workspaces/ws-1/snapshots/1")
-        .send()
-        .await
-        .unwrap();
-    let text = resp.text().await.unwrap();
-    assert!(
-        text.contains(&manifest),
-        "checkpoint manifest not verbatim in {text}"
-    );
-}
-
-#[tokio::test]
-async fn force_checkpoint_dedupes_unchanged_heads_and_self_force() {
-    let relay = start_relay(300).await;
-    create_ws(&relay, "ws-d").await;
-    upload_fixture_chunk(&relay, "ws-d").await;
-    acquire(&relay, "ws-d", "laptop-a").await;
-    let resp = put_head_raw(&relay, "ws-d", 0, &test_manifest("ws-d"), "laptop-a", 1).await;
-    assert_eq!(resp.status(), 200);
-
-    // Force by another device: one checkpoint of the current head.
-    let resp = relay
-        .post("/v1/workspaces/ws-d/lease/force")
-        .json(&json!({ "device_id": "laptop-b" }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    // Force by yet another device with the head unchanged: already
-    // captured — no duplicate row.
-    let resp = relay
-        .post("/v1/workspaces/ws-d/lease/force")
-        .json(&json!({ "device_id": "laptop-c" }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    // Force by the current holder: nothing new to preserve.
-    let resp = relay
-        .post("/v1/workspaces/ws-d/lease/force")
-        .json(&json!({ "device_id": "laptop-c" }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-
-    let resp = relay
-        .get("/v1/workspaces/ws-d/snapshots")
-        .send()
-        .await
-        .unwrap();
-    let body: Value = resp.json().await.unwrap();
-    let checkpoints = body["snapshots"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|s| s["kind"] == "checkpoint")
-        .count();
-    assert_eq!(
-        checkpoints, 1,
-        "exactly one checkpoint for an unchanged head"
-    );
-}
 
 #[test]
 fn checkpoint_retention_keeps_the_last_hour_unconditionally() {
@@ -1847,138 +1462,11 @@ fn checkpoint_retention_keeps_only_the_newest_per_bucket() {
     assert_eq!(prune(now, &days), vec![2]);
 }
 
-/// §14: a checkpoint insert prunes the workspace's old checkpoints (keep
-/// the last hour, then newest/hour for 24h, then newest/day for 7d); named
-/// snapshots are never pruned and the chunk pool is never touched.
-#[tokio::test]
-async fn checkpoint_retention_prunes_on_force_checkpoint() {
-    let relay = start_relay(300).await;
-    create_ws(&relay, "ws-1").await;
-    upload_fixture_chunk(&relay, "ws-1").await;
-    acquire(&relay, "ws-1", "laptop-a").await;
-
-    // Distinct manifest bytes per head (scanned_at_secs) so every force
-    // has new state to checkpoint (unchanged heads dedupe, §12).
-    let manifest = |n: i64| {
-        let mut m: Value = serde_json::from_str(&test_manifest("ws-1")).unwrap();
-        m["scanned_at_secs"] = json!(n);
-        m.to_string()
-    };
-    let resp = put_head_raw(&relay, "ws-1", 0, &manifest(0), "laptop-a", 1).await;
-    assert_eq!(resp.status(), 200);
-
-    // Six checkpoints: a new device forces (checkpointing the head), then
-    // pushes a fresh head under the forced lease. Devices rotate because a
-    // forcer who already holds the lease records nothing.
-    let devices = [
-        "laptop-b", "laptop-c", "laptop-d", "laptop-e", "laptop-f", "laptop-g",
-    ];
-    for (i, device) in devices.iter().enumerate() {
-        let i = i as i64 + 1;
-        let resp = relay
-            .post("/v1/workspaces/ws-1/lease/force")
-            .json(&json!({ "device_id": device }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let generation = resp.json::<Value>().await.unwrap()["generation"]
-            .as_i64()
-            .unwrap();
-        let resp = put_head_raw(&relay, "ws-1", i, &manifest(i), device, generation).await;
-        assert_eq!(resp.status(), 200);
-    }
-
-    // A named snapshot: never pruned, whatever its age (§14).
-    let resp = relay
-        .post("/v1/workspaces/ws-1/snapshots")
-        .json(&json!({
-            "name": "keep me",
-            "device": "laptop-a",
-            "manifest": serde_json::from_str::<Value>(&manifest(6)).unwrap(),
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
-
-    // Backdate ids 1..=6 (the checkpoints) and 7 (the named snapshot) via a
-    // second connection. The ages sit mid-bucket, so a slow test run cannot
-    // straddle an edge.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-    let db = crate::db::Db::open(&relay._data_dir.path().join("relay.db")).unwrap();
-    const HOUR: i64 = 3600;
-    const DAY: i64 = 24 * HOUR;
-    for (id, age) in [
-        (1, 30 * 60),         // last hour: kept
-        (2, 2 * HOUR + 300),  // hourly tier, newest of its hour: kept
-        (3, 2 * HOUR + 1800), // same hour bucket but older: pruned
-        (4, DAY + 6 * HOUR),  // daily tier, newest of day 1: kept
-        (5, 3 * DAY),         // daily tier, newest of day 3: kept
-        (6, 8 * DAY),         // past 7 days: pruned
-        (7, 8 * DAY),         // named: kept at any age
-    ] {
-        db.backdate_snapshot("ws-1", id, now - age).unwrap();
-    }
-
-    // The trigger: one more checkpoint via lease/force (the head moved
-    // since the last checkpoint, so this inserts one and prunes).
-    let resp = relay
-        .post("/v1/workspaces/ws-1/lease/force")
-        .json(&json!({ "device_id": "laptop-h" }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-
-    let resp = relay
-        .get("/v1/workspaces/ws-1/snapshots")
-        .send()
-        .await
-        .unwrap();
-    let body: Value = resp.json().await.unwrap();
-    let snapshots = body["snapshots"].as_array().unwrap();
-    let ids: Vec<i64> = snapshots
-        .iter()
-        .map(|s| s["id"].as_i64().unwrap())
-        .collect();
-    assert_eq!(ids, vec![8, 7, 5, 4, 2, 1], "newest first");
-    assert_eq!(snapshots[1]["kind"], "named");
-    assert_eq!(snapshots[1]["name"], "keep me");
-    for s in snapshots {
-        if s["id"] != 7 {
-            assert_eq!(s["kind"], "checkpoint");
-        }
-    }
-
-    // Retention is metadata-only: the chunks a pruned snapshot referenced
-    // are still served (there is no GC, §14).
-    let resp = relay
-        .get(&format!(
-            "/v1/workspaces/ws-1/chunks/{}",
-            chunk_hash(b"foo")
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-}
 
 #[tokio::test]
 async fn head_put_rejects_malformed_chunk_hashes() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     create_ws(&relay, "ws-hash").await;
-    let resp = relay
-        .post("/v1/workspaces/ws-hash/lease/acquire")
-        .json(&json!({ "device_id": "laptop-a" }))
-        .send()
-        .await
-        .unwrap();
-    let body: Value = resp.json().await.unwrap();
-    let generation = body["generation"].clone();
 
     // A manifest whose entry references an uppercase/short hash: 400.
     let mut manifest: Value = serde_json::from_str(&test_manifest("ws-hash")).unwrap();
@@ -1986,7 +1474,6 @@ async fn head_put_rejects_malformed_chunk_hashes() {
     let resp = relay
         .put("/v1/workspaces/ws-hash/head")
         .header("x-pear-device", "laptop-a")
-        .header("x-pear-generation", generation.to_string())
         .json(&json!({ "base_seq": 0, "manifest": manifest }))
         .send()
         .await
@@ -1996,23 +1483,14 @@ async fn head_put_rejects_malformed_chunk_hashes() {
 
 #[tokio::test]
 async fn head_put_rejects_chunks_absent_from_the_pool() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     create_ws(&relay, "ws-absent").await;
-    let resp = relay
-        .post("/v1/workspaces/ws-absent/lease/acquire")
-        .json(&json!({ "device_id": "laptop-a" }))
-        .send()
-        .await
-        .unwrap();
-    let body: Value = resp.json().await.unwrap();
-    let generation = body["generation"].clone();
 
     // The manifest references a well-formed hash that was never uploaded.
     let manifest: Value = serde_json::from_str(&test_manifest("ws-absent")).unwrap();
     let resp = relay
         .put("/v1/workspaces/ws-absent/head")
         .header("x-pear-device", "laptop-a")
-        .header("x-pear-generation", generation.to_string())
         .json(&json!({ "base_seq": 0, "manifest": manifest }))
         .send()
         .await
@@ -2031,7 +1509,6 @@ async fn head_put_rejects_chunks_absent_from_the_pool() {
     let resp = relay
         .put("/v1/workspaces/ws-absent/head")
         .header("x-pear-device", "laptop-a")
-        .header("x-pear-generation", generation.to_string())
         .json(&json!({
             "base_seq": 0,
             "manifest": serde_json::from_str::<Value>(&test_manifest("ws-absent")).unwrap(),
@@ -2044,17 +1521,9 @@ async fn head_put_rejects_chunks_absent_from_the_pool() {
 
 #[tokio::test]
 async fn head_put_rejects_file_dir_path_conflicts() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     create_ws(&relay, "ws-conflict").await;
     upload_fixture_chunk(&relay, "ws-conflict").await;
-    let resp = relay
-        .post("/v1/workspaces/ws-conflict/lease/acquire")
-        .json(&json!({ "device_id": "laptop-a" }))
-        .send()
-        .await
-        .unwrap();
-    let body: Value = resp.json().await.unwrap();
-    let generation = body["generation"].clone();
 
     // A manifest with both a file `src` and a file `src/main.rs`: a file
     // cannot also be a directory. The `src-x` sibling makes the conflict
@@ -2070,7 +1539,6 @@ async fn head_put_rejects_file_dir_path_conflicts() {
     let resp = relay
         .put("/v1/workspaces/ws-conflict/head")
         .header("x-pear-device", "laptop-a")
-        .header("x-pear-generation", generation.to_string())
         .json(&json!({ "base_seq": 0, "manifest": manifest }))
         .send()
         .await
@@ -2147,20 +1615,10 @@ async fn put_chunk_as(
         .status()
 }
 
-/// Lease acquire as `token`; returns the status.
-async fn acquire_as(relay: &TestRelay, token: &str, ws: &str, device: &str) -> reqwest::StatusCode {
-    relay
-        .post_as(token, &format!("/v1/workspaces/{ws}/lease/acquire"))
-        .json(&json!({ "device_id": device }))
-        .send()
-        .await
-        .unwrap()
-        .status()
-}
 
 #[tokio::test]
 async fn users_create_and_list_are_admin_only() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
 
     // Admin creates a user: 201 with the shown-once token (16 bytes of
     // hex, like workspace ids).
@@ -2217,7 +1675,7 @@ async fn users_create_and_list_are_admin_only() {
 
 #[tokio::test]
 async fn principal_resolution_admin_user_and_unknown_tokens() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     let jane = create_user(&relay, "jane").await;
 
     // An unknown token is a 401, as is no token at all.
@@ -2246,7 +1704,7 @@ async fn principal_resolution_admin_user_and_unknown_tokens() {
 
 #[tokio::test]
 async fn teams_create_membership_and_owner_only_management() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     let jane = create_user(&relay, "jane").await;
     let bob = create_user(&relay, "bob").await;
     // Carol's token is never used directly — she only needs to exist so
@@ -2398,8 +1856,7 @@ async fn teams_create_membership_and_owner_only_management() {
 }
 
 /// §28: commit a one-file plaintext head as `token`, with the file's path
-/// the variable under test. Acquires the lease fresh each call so 409
-/// rejections (which commit nothing) can be retried back-to-back.
+/// the variable under test.
 async fn put_head_one_file(
     relay: &TestRelay,
     token: &str,
@@ -2408,15 +1865,6 @@ async fn put_head_one_file(
     path: &str,
 ) -> reqwest::Response {
     assert_eq!(put_chunk_as(relay, token, ws, b"foo").await, 200);
-    let resp = relay
-        .post_as(token, &format!("/v1/workspaces/{ws}/lease/acquire"))
-        .json(&json!({ "device_id": "dev" }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200, "acquire lease on {ws}");
-    let lease: Value = resp.json().await.unwrap();
-    let generation = lease["generation"].as_i64().unwrap();
     let manifest = json!({
         "version": 1,
         "workspace_id": ws,
@@ -2435,7 +1883,6 @@ async fn put_head_one_file(
         .put_as(token, &format!("/v1/workspaces/{ws}/head"))
         .header("content-type", "application/json")
         .header("x-pear-device", "dev")
-        .header("x-pear-generation", generation.to_string())
         .body(format!(
             r#"{{"base_seq":{base_seq},"manifest":{manifest}}}"#
         ))
@@ -2449,7 +1896,7 @@ async fn put_head_one_file(
 /// member-management gate (no admin override).
 #[tokio::test]
 async fn team_env_policy_create_set_get_and_owner_gate() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     let jane = create_user(&relay, "jane").await;
     let bob = create_user(&relay, "bob").await;
 
@@ -2571,7 +2018,7 @@ async fn team_env_policy_create_set_get_and_owner_gate() {
 /// The path set is the scanner's own definition (`is_dotenv`).
 #[tokio::test]
 async fn sync_env_commit_validation() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     let jane = create_user(&relay, "jane").await;
 
     // A forbidding team and a default team, each with a workspace, plus
@@ -2666,7 +2113,7 @@ async fn sync_env_commit_validation() {
 /// oversight: an e2e head commits fine on a forbidding team.
 #[tokio::test]
 async fn sync_env_e2e_workspace_is_exempt_relay_side() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     let jane = create_user(&relay, "jane").await;
     let strict = create_team(&relay, &jane, "strict").await;
     let resp = relay
@@ -2680,19 +2127,9 @@ async fn sync_env_e2e_workspace_is_exempt_relay_side() {
 
     assert_eq!(put_chunk_as(&relay, &jane, "ws-e2e", b"foo").await, 200);
     let resp = relay
-        .post_as(&jane, "/v1/workspaces/ws-e2e/lease/acquire")
-        .json(&json!({ "device_id": "dev" }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let lease: Value = resp.json().await.unwrap();
-    let generation = lease["generation"].as_i64().unwrap();
-    let resp = relay
         .put_as(&jane, "/v1/workspaces/ws-e2e/head")
         .header("content-type", "application/json")
         .header("x-pear-device", "dev")
-        .header("x-pear-generation", generation.to_string())
         .json(&json!({
             "base_seq": 0,
             "manifest_enc": fake_manifest_enc(),
@@ -2713,7 +2150,7 @@ async fn sync_env_e2e_workspace_is_exempt_relay_side() {
 /// workspace (404 — existence hiding).
 #[tokio::test]
 async fn role_matrix_on_workspace_routes() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     let jane = create_user(&relay, "jane").await;
     let bob = create_user(&relay, "bob").await;
     let carol = create_user(&relay, "carol").await;
@@ -2726,12 +2163,10 @@ async fn role_matrix_on_workspace_routes() {
     // pushes a head.
     create_ws_as(&relay, &jane, "ws-1", "api", Some(&acme)).await;
     assert_eq!(put_chunk_as(&relay, &jane, "ws-1", b"foo").await, 200);
-    assert_eq!(acquire_as(&relay, &jane, "ws-1", "jane-laptop").await, 200);
     let resp = relay
         .put_as(&jane, "/v1/workspaces/ws-1/head")
         .header("content-type", "application/json")
         .header("x-pear-device", "jane-laptop")
-        .header("x-pear-generation", "1")
         .body(format!(
             r#"{{"base_seq":0,"manifest":{}}}"#,
             test_manifest("ws-1")
@@ -2780,7 +2215,6 @@ async fn role_matrix_on_workspace_routes() {
         .put_as(&carol, "/v1/workspaces/ws-1/head")
         .header("content-type", "application/json")
         .header("x-pear-device", "carol-laptop")
-        .header("x-pear-generation", "1")
         .body(format!(
             r#"{{"base_seq":1,"manifest":{}}}"#,
             test_manifest("ws-1")
@@ -2789,18 +2223,6 @@ async fn role_matrix_on_workspace_routes() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 403, "reader put head");
-    assert_eq!(
-        acquire_as(&relay, &carol, "ws-1", "carol-laptop").await,
-        403,
-        "reader acquire"
-    );
-    let resp = relay
-        .post_as(&carol, "/v1/workspaces/ws-1/lease/force")
-        .json(&json!({ "device_id": "carol-laptop" }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 403, "reader force");
     let resp = relay
         .post_as(&carol, "/v1/workspaces/ws-1/snapshots")
         .json(&json!({
@@ -2820,26 +2242,17 @@ async fn role_matrix_on_workspace_routes() {
         .unwrap();
     assert_eq!(resp.status(), 403, "reader cannot attach");
 
-    // Writer (bob): the write routes accept him — force the lease (jane's
-    // is valid) and commit on top of her head.
+    // Writer (bob): the write routes accept him — §32, he simply commits
+    // on top of jane's head; no lease to take.
     assert_eq!(
         put_chunk_as(&relay, &bob, "ws-1", b"foo").await,
         200,
         "writer put chunk"
     );
     let resp = relay
-        .post_as(&bob, "/v1/workspaces/ws-1/lease/force")
-        .json(&json!({ "device_id": "bob-laptop" }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200, "writer force");
-    let generation = resp.json::<Value>().await.unwrap()["generation"].clone();
-    let resp = relay
         .put_as(&bob, "/v1/workspaces/ws-1/head")
         .header("content-type", "application/json")
         .header("x-pear-device", "bob-laptop")
-        .header("x-pear-generation", generation.to_string())
         .body(format!(
             r#"{{"base_seq":1,"manifest":{}}}"#,
             test_manifest("ws-1")
@@ -2859,10 +2272,9 @@ async fn role_matrix_on_workspace_routes() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 201, "writer snapshot create");
-    // ...and a reader can fetch that snapshot back (id 1 is the checkpoint
-    // bob's force recorded first).
+    // ...and a reader can fetch that snapshot back.
     let resp = relay
-        .get_as(&carol, "/v1/workspaces/ws-1/snapshots/2")
+        .get_as(&carol, "/v1/workspaces/ws-1/snapshots/1")
         .send()
         .await
         .unwrap();
@@ -2895,11 +2307,6 @@ async fn role_matrix_on_workspace_routes() {
         404,
         "non-member put chunk"
     );
-    assert_eq!(
-        acquire_as(&relay, &dave, "ws-1", "dave-laptop").await,
-        404,
-        "non-member acquire"
-    );
     let resp = relay
         .post_as(&dave, "/v1/workspaces/ws-1/snapshots")
         .json(&json!({
@@ -2931,7 +2338,7 @@ async fn role_matrix_on_workspace_routes() {
 
 #[tokio::test]
 async fn workspace_resolution_by_team_and_name() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     let jane = create_user(&relay, "jane").await;
     let carol = create_user(&relay, "carol").await;
     let dave = create_user(&relay, "dave").await;
@@ -2987,7 +2394,7 @@ async fn workspace_resolution_by_team_and_name() {
 
 #[tokio::test]
 async fn attach_route_requires_workspace_owner_and_team_writer() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     let jane = create_user(&relay, "jane").await;
     let bob = create_user(&relay, "bob").await;
     let carol = create_user(&relay, "carol").await;
@@ -3075,7 +2482,7 @@ async fn attach_route_requires_workspace_owner_and_team_writer() {
 
 #[tokio::test]
 async fn workspace_names_are_unique_within_a_team() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     let jane = create_user(&relay, "jane").await;
     let bob = create_user(&relay, "bob").await;
     let carol = create_user(&relay, "carol").await;
@@ -3155,11 +2562,9 @@ async fn wait_ws_connected(feed: &pear_core::relay::HeadFeed) {
 
 #[tokio::test]
 async fn ws_fanout_delivers_head_changed_after_commit() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     create_ws(&relay, "ws-1").await;
     upload_fixture_chunk(&relay, "ws-1").await;
-    let lease = acquire(&relay, "ws-1", "dev").await;
-    let generation = lease["generation"].as_i64().unwrap();
 
     // Subscribe with the real pear-core listener before the commit.
     let client = pear_core::relay::RelayClient::new(&relay.base, TOKEN, "ws-1", "ws-test");
@@ -3173,14 +2578,14 @@ async fn ws_fanout_delivers_head_changed_after_commit() {
         .expect("head_now catch-up");
     assert_eq!(seq, 0);
 
-    let resp = put_head_raw(&relay, "ws-1", 0, &test_manifest("ws-1"), "dev", generation).await;
+    let resp = put_head_raw(&relay, "ws-1", 0, &test_manifest("ws-1"), "dev").await;
     assert_eq!(resp.status(), 200);
     let seq = feed
         .recv_timeout(Duration::from_secs(5))
         .expect("head_changed hint for the first commit");
     assert_eq!(seq, 1);
 
-    let resp = put_head_raw(&relay, "ws-1", 1, &test_manifest("ws-1"), "dev", generation).await;
+    let resp = put_head_raw(&relay, "ws-1", 1, &test_manifest("ws-1"), "dev").await;
     assert_eq!(resp.status(), 200);
     let seq = feed
         .recv_timeout(Duration::from_secs(5))
@@ -3196,12 +2601,10 @@ async fn ws_subscribe_sends_head_now_with_the_current_seq_first() {
     use futures_util::StreamExt;
     use tokio_tungstenite::tungstenite;
 
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     create_ws(&relay, "ws-1").await;
     upload_fixture_chunk(&relay, "ws-1").await;
-    let lease = acquire(&relay, "ws-1", "dev").await;
-    let generation = lease["generation"].as_i64().unwrap();
-    let resp = put_head_raw(&relay, "ws-1", 0, &test_manifest("ws-1"), "dev", generation).await;
+    let resp = put_head_raw(&relay, "ws-1", 0, &test_manifest("ws-1"), "dev").await;
     assert_eq!(resp.status(), 200);
 
     let url = format!(
@@ -3226,7 +2629,7 @@ async fn ws_subscribe_sends_head_now_with_the_current_seq_first() {
     );
 
     // Ordering: a post-connect commit's head_changed arrives after it.
-    let resp = put_head_raw(&relay, "ws-1", 1, &test_manifest("ws-1"), "dev", generation).await;
+    let resp = put_head_raw(&relay, "ws-1", 1, &test_manifest("ws-1"), "dev").await;
     assert_eq!(resp.status(), 200);
     let next = tokio::time::timeout(Duration::from_secs(5), ws.next())
         .await
@@ -3247,7 +2650,7 @@ async fn ws_subscribe_head_now_is_zero_without_a_head() {
     use futures_util::StreamExt;
     use tokio_tungstenite::tungstenite;
 
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     create_ws(&relay, "ws-1").await;
 
     let url = format!(
@@ -3273,7 +2676,7 @@ async fn ws_subscribe_head_now_is_zero_without_a_head() {
 
 #[tokio::test]
 async fn ws_requires_bearer_and_role_like_other_routes() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     create_ws(&relay, "ws-1").await; // admin-owned
 
     // No token at all: the router-wide auth middleware rejects first.
@@ -3313,14 +2716,12 @@ async fn ws_requires_bearer_and_role_like_other_routes() {
 
 #[tokio::test]
 async fn ws_head_commit_succeeds_with_zero_subscribers() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     create_ws(&relay, "ws-1").await;
     upload_fixture_chunk(&relay, "ws-1").await;
-    let lease = acquire(&relay, "ws-1", "dev").await;
-    let generation = lease["generation"].as_i64().unwrap();
 
     // Nobody has ever subscribed: the commit is unaffected (§14).
-    let resp = put_head_raw(&relay, "ws-1", 0, &test_manifest("ws-1"), "dev", generation).await;
+    let resp = put_head_raw(&relay, "ws-1", 0, &test_manifest("ws-1"), "dev").await;
     assert_eq!(resp.status(), 200);
 }
 
@@ -3331,7 +2732,7 @@ async fn ws_head_commit_succeeds_with_zero_subscribers() {
 #[tokio::test]
 async fn ws_broadcast_tolerates_lagging_subscribers() {
     let data_dir = tempfile::tempdir().unwrap();
-    let state = AppState::new(TOKEN, data_dir.path(), 300).unwrap();
+    let state = AppState::new(TOKEN, data_dir.path()).unwrap();
 
     // No receivers at all: the send is dropped, never an error path.
     state.notify_head_changed("ws-1", 1);
@@ -3362,7 +2763,7 @@ async fn ws_broadcast_tolerates_lagging_subscribers() {
 #[test]
 fn broadcast_channels_are_dropped_when_no_receivers_remain() {
     let data_dir = tempfile::tempdir().unwrap();
-    let state = AppState::new(TOKEN, data_dir.path(), 300).unwrap();
+    let state = AppState::new(TOKEN, data_dir.path()).unwrap();
 
     let rx = state.subscribe_head("ws-1");
     state.notify_head_changed("ws-1", 1);
@@ -3388,7 +2789,7 @@ async fn ws_fanout_reads_socket_pongs_ping_and_ends_on_disconnect() {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::{self, Message};
 
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     create_ws(&relay, "ws-1").await;
 
     let url = format!(
@@ -3442,43 +2843,36 @@ async fn wait_ws_receiver_count(relay: &TestRelay, workspace: &str, want: usize)
     panic!("ws receiver count for {workspace} did not reach {want}");
 }
 
-/// §14 (autoreview): lease fencing and auth/role failures share the 403
-/// status — the fencing body carries `"fenced": true`, the role body
-/// does not, so clients can tell "lease lost" from "role revoked".
+/// §32: with leases retired, a 403 on the write path means exactly one
+/// thing — this device has no Writer role. Nothing carries a `fenced`
+/// marker any more, so the client's "token or role revoked" diagnostic is
+/// the only reading, and a reader degrades to mirror mode on it.
 #[tokio::test]
-async fn forbidden_bodies_distinguish_fencing_from_auth() {
-    let relay = start_relay(300).await;
-    create_ws(&relay, "ws-1").await;
-    let lease = acquire(&relay, "ws-1", "laptop-a").await;
-    let generation = lease["generation"].as_i64().unwrap();
-
-    // Fencing: another device heartbeats → 403 with the fenced marker.
-    let resp = relay
-        .post("/v1/workspaces/ws-1/lease/heartbeat")
-        .json(&json!({ "device_id": "laptop-b", "generation": generation }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 403);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["fenced"], true, "fencing body is marked");
-
-    // Auth/role: a team reader heartbeats (writer required) → 403 with
-    // no marker, so the client can print "token or role revoked".
+async fn head_writes_403_only_on_role() {
+    let relay = start_relay().await;
     let owner = create_user(&relay, "owner").await;
     let team = create_team(&relay, &owner, "acme").await;
     create_ws_as(&relay, &owner, "ws-2", "demo", Some(&team)).await;
     let rita = create_user(&relay, "rita").await;
     add_member(&relay, &owner, &team, "rita", "reader").await;
+
     let resp = relay
-        .post_as(&rita, "/v1/workspaces/ws-2/lease/heartbeat")
-        .json(&json!({ "device_id": "x", "generation": 1 }))
+        .put_as(&rita, "/v1/workspaces/ws-2/head")
+        .header("content-type", "application/json")
+        .header("x-pear-device", "ritas-laptop")
+        .body(format!(
+            r#"{{"base_seq":0,"manifest":{}}}"#,
+            test_manifest("ws-2")
+        ))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 403);
+    assert_eq!(resp.status(), 403, "a reader may not move the head");
     let body: Value = resp.json().await.unwrap();
-    assert!(body.get("fenced").is_none(), "auth body carries no marker");
+    assert!(
+        body.get("fenced").is_none(),
+        "nothing is fenced any more (§32): {body}"
+    );
 }
 
 /// §14 (autoreview): a live WS subscription re-checks the reader role
@@ -3489,7 +2883,7 @@ async fn ws_fanout_drops_subscriber_when_role_revoked() {
     use futures_util::StreamExt;
     use tokio_tungstenite::tungstenite::{self, Message};
 
-    let relay = start_relay_with(300, 1).await;
+    let relay = start_relay_with(1).await;
     let owner = create_user(&relay, "owner").await;
     let acme = create_team(&relay, &owner, "acme").await;
     let other = create_team(&relay, &owner, "other").await;
@@ -3537,7 +2931,7 @@ async fn ws_fanout_drops_subscriber_when_role_revoked() {
 /// that could never be addressed as one segment.
 #[tokio::test]
 async fn create_rejects_unaddressable_names() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     // Team creation needs a user principal (the admin seats no owner).
     let owner = create_user(&relay, "owner").await;
 
@@ -3580,29 +2974,22 @@ async fn create_rejects_unaddressable_names() {
     assert_eq!(resp.status(), 200, "percent-encoded name resolves");
 }
 
-/// §14 (autoreview): snapshot name/device and lease device ids are stored
-/// and echoed verbatim (named snapshots forever), so they are bounded
-/// like every other stored string.
+/// §14 (autoreview): snapshot name/device ids and the §32 head-commit
+/// device header are stored and echoed verbatim (named snapshots
+/// forever), so they are bounded like every other stored string.
 #[tokio::test]
 async fn stored_strings_are_bounded() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     create_ws(&relay, "ws-1").await;
+    upload_fixture_chunk(&relay, "ws-1").await;
 
     let huge = "x".repeat(4096);
-    let resp = relay
-        .post("/v1/workspaces/ws-1/lease/acquire")
-        .json(&json!({ "device_id": huge }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 400, "unbounded lease device id");
-    let resp = relay
-        .post("/v1/workspaces/ws-1/lease/acquire")
-        .json(&json!({ "device_id": "with\nnewline" }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 400, "control characters in device id");
+    let resp = put_head_raw(&relay, "ws-1", 0, &test_manifest("ws-1"), &huge).await;
+    assert_eq!(resp.status(), 400, "unbounded head device id");
+    // A control character cannot even be a header value: the relay's own
+    // bound is exercised with a legal-but-unsafe one (a path separator).
+    let resp = put_head_raw(&relay, "ws-1", 0, &test_manifest("ws-1"), "with/slash").await;
+    assert_eq!(resp.status(), 400, "'/' in device id");
 
     let manifest: Value = serde_json::from_str(&test_manifest("ws-1")).unwrap();
     let resp = relay
@@ -3631,38 +3018,13 @@ async fn stored_strings_are_bounded() {
     );
 }
 
-/// §15 (autoreview): expiry is terminal for a generation — a lapsed
-/// lease cannot be revived by heartbeat (acquire treats the same
-/// situation as a steal with a generation bump).
-#[tokio::test]
-async fn heartbeat_after_expiry_is_fenced_not_revived() {
-    let relay = start_relay(1).await;
-    create_ws(&relay, "ws-1").await;
-    let lease = acquire(&relay, "ws-1", "dev").await;
-    let generation = lease["generation"].as_i64().unwrap();
-
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    let resp = relay
-        .post("/v1/workspaces/ws-1/lease/heartbeat")
-        .json(&json!({ "device_id": "dev", "generation": generation }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 403, "an expired lease cannot be revived");
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["fenced"], true);
-
-    // The same device can only come back via acquire, with the bump.
-    let lease2 = acquire(&relay, "ws-1", "dev").await;
-    assert_eq!(lease2["generation"].as_i64().unwrap(), generation + 1);
-}
 
 /// §15 (autoreview): chunks/missing bounds the batch — every hash costs
 /// a visibility query under the one global DB mutex, so an unbounded
 /// list lets any reader stall every route.
 #[tokio::test]
 async fn chunks_missing_bounds_the_batch() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     create_ws(&relay, "ws-1").await;
 
     let hashes = vec!["a".repeat(64); 50_001];
@@ -3702,13 +3064,11 @@ async fn put_head_enc(
     manifest_enc: &str,
     chunk_hashes: &[String],
     device: &str,
-    generation: i64,
 ) -> reqwest::Response {
     relay
         .put(&format!("/v1/workspaces/{ws}/head"))
         .header("content-type", "application/json")
         .header("x-pear-device", device)
-        .header("x-pear-generation", generation.to_string())
         .json(&json!({
             "base_seq": base_seq,
             "manifest_enc": manifest_enc,
@@ -3753,7 +3113,7 @@ fn signed_bundle(name: &str) -> SignedBundle {
 
 #[tokio::test]
 async fn e2e_flag_at_create_immutable_and_visible_in_reads() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
 
     // Plain by default; e2e when requested — both visible on GET.
     create_ws(&relay, "ws-plain").await;
@@ -3821,7 +3181,7 @@ async fn e2e_flag_at_create_immutable_and_visible_in_reads() {
 
 #[tokio::test]
 async fn e2e_head_commit_rules_and_plain_head_unchanged() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     create_ws(&relay, "ws-plain").await;
     create_ws_e2e_as(&relay, TOKEN, "ws-e2e", "sealed", None).await;
     upload_fixture_chunk(&relay, "ws-plain").await;
@@ -3830,15 +3190,12 @@ async fn e2e_head_commit_rules_and_plain_head_unchanged() {
     let enc = fake_manifest_enc();
 
     // Plain manifest on the e2e workspace: 409 e2e_mismatch (no downgrade).
-    let lease = acquire(&relay, "ws-e2e", "laptop-a").await;
-    let generation = lease["generation"].as_i64().unwrap();
     let resp = put_head_raw(
         &relay,
         "ws-e2e",
         0,
         &test_manifest("ws-e2e"),
         "laptop-a",
-        generation,
     )
     .await;
     assert_eq!(resp.status(), 409, "plaintext head on an e2e workspace");
@@ -3847,8 +3204,6 @@ async fn e2e_head_commit_rules_and_plain_head_unchanged() {
 
     // manifest_enc on the plain workspace: 409 e2e_mismatch (no upgrade
     // confusion either).
-    let lease = acquire(&relay, "ws-plain", "laptop-a").await;
-    let plain_gen = lease["generation"].as_i64().unwrap();
     let resp = put_head_enc(
         &relay,
         "ws-plain",
@@ -3856,7 +3211,6 @@ async fn e2e_head_commit_rules_and_plain_head_unchanged() {
         &enc,
         std::slice::from_ref(&chunk),
         "laptop-a",
-        plain_gen,
     )
     .await;
     assert_eq!(resp.status(), 409, "manifest_enc on a plain workspace");
@@ -3872,7 +3226,6 @@ async fn e2e_head_commit_rules_and_plain_head_unchanged() {
         "not base64!",
         std::slice::from_ref(&chunk),
         "laptop-a",
-        generation,
     )
     .await;
     assert_eq!(resp.status(), 400, "bad base64");
@@ -3883,17 +3236,15 @@ async fn e2e_head_commit_rules_and_plain_head_unchanged() {
         &enc,
         &["zz".to_string()],
         "laptop-a",
-        generation,
     )
     .await;
     assert_eq!(resp.status(), 400, "bad chunk hash");
     let absent = chunk_hash(b"never uploaded");
-    let resp = put_head_enc(&relay, "ws-e2e", 0, &enc, &[absent], "laptop-a", generation).await;
+    let resp = put_head_enc(&relay, "ws-e2e", 0, &enc, &[absent], "laptop-a").await;
     assert_eq!(resp.status(), 400, "chunk not in the pool");
     let resp = relay
         .put("/v1/workspaces/ws-e2e/head")
         .header("x-pear-device", "laptop-a")
-        .header("x-pear-generation", generation.to_string())
         .json(&json!({ "base_seq": 0, "manifest_enc": enc }))
         .send()
         .await
@@ -3911,7 +3262,6 @@ async fn e2e_head_commit_rules_and_plain_head_unchanged() {
         &enc,
         std::slice::from_ref(&chunk),
         "laptop-a",
-        generation,
     )
     .await;
     assert_eq!(resp.status(), 200);
@@ -3936,7 +3286,7 @@ async fn e2e_head_commit_rules_and_plain_head_unchanged() {
     assert_eq!(body["manifest_enc"], enc, "returned verbatim");
     assert!(body.get("manifest").is_none(), "no plaintext half");
 
-    // CAS and fencing are unchanged on the e2e path.
+    // The CAS behaves identically on the e2e path.
     let resp = put_head_enc(
         &relay,
         "ws-e2e",
@@ -3944,12 +3294,12 @@ async fn e2e_head_commit_rules_and_plain_head_unchanged() {
         &enc,
         std::slice::from_ref(&chunk),
         "laptop-a",
-        generation,
     )
     .await;
     assert_eq!(resp.status(), 409);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body, json!({ "current_seq": 1 }));
+    // §32: a second device with the right base_seq simply commits.
     let resp = put_head_enc(
         &relay,
         "ws-e2e",
@@ -3957,10 +3307,9 @@ async fn e2e_head_commit_rules_and_plain_head_unchanged() {
         &enc,
         std::slice::from_ref(&chunk),
         "laptop-b",
-        generation,
     )
     .await;
-    assert_eq!(resp.status(), 403, "fenced: wrong device");
+    assert_eq!(resp.status(), 200, "any writer may advance an e2e head");
 
     // The plain workspace's head flow is byte-for-byte the old one.
     let resp = put_head_raw(
@@ -3969,7 +3318,6 @@ async fn e2e_head_commit_rules_and_plain_head_unchanged() {
         0,
         &test_manifest("ws-plain"),
         "laptop-a",
-        plain_gen,
     )
     .await;
     assert_eq!(resp.status(), 200);
@@ -3985,8 +3333,8 @@ async fn e2e_head_commit_rules_and_plain_head_unchanged() {
 }
 
 #[tokio::test]
-async fn e2e_snapshot_commit_get_and_force_checkpoint() {
-    let relay = start_relay(300).await;
+async fn e2e_snapshot_commit_get_and_head_roundtrip() {
+    let relay = start_relay().await;
     create_ws_e2e_as(&relay, TOKEN, "ws-e2e", "sealed", None).await;
     create_ws(&relay, "ws-plain").await;
     upload_fixture_chunk(&relay, "ws-e2e").await;
@@ -4035,11 +3383,8 @@ async fn e2e_snapshot_commit_get_and_force_checkpoint() {
     assert_eq!(body["manifest_enc"], enc, "snapshot manifest_enc verbatim");
     assert!(body.get("manifest").is_none());
 
-    // A force takeover checkpoints the e2e head verbatim (the checkpoint
-    // path cannot parse the encrypted manifest — it must not 500).
-    acquire(&relay, "ws-e2e", "laptop-a").await;
-    let lease = acquire(&relay, "ws-e2e", "laptop-a").await;
-    let generation = lease["generation"].as_i64().unwrap();
+    // An e2e head commits and serves back verbatim (§32 retired the
+    // relay-made force checkpoints; snapshots are the surviving route).
     let resp = put_head_enc(
         &relay,
         "ws-e2e",
@@ -4047,38 +3392,17 @@ async fn e2e_snapshot_commit_get_and_force_checkpoint() {
         &enc,
         std::slice::from_ref(&chunk),
         "laptop-a",
-        generation,
     )
     .await;
     assert_eq!(resp.status(), 200);
     let resp = relay
-        .post("/v1/workspaces/ws-e2e/lease/force")
-        .json(&json!({ "device_id": "laptop-b" }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let resp = relay
-        .get("/v1/workspaces/ws-e2e/snapshots")
+        .get("/v1/workspaces/ws-e2e/head")
         .send()
         .await
         .unwrap();
     let body: Value = resp.json().await.unwrap();
-    let checkpoints: Vec<&Value> = body["snapshots"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|s| s["kind"] == "checkpoint")
-        .collect();
-    assert_eq!(checkpoints.len(), 1, "the force made one checkpoint");
-    let checkpoint_id = checkpoints[0]["id"].as_i64().unwrap();
-    let resp = relay
-        .get(&format!("/v1/workspaces/ws-e2e/snapshots/{checkpoint_id}"))
-        .send()
-        .await
-        .unwrap();
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["manifest_enc"], enc, "checkpointed e2e head verbatim");
+    assert_eq!(body["e2e"], true);
+    assert_eq!(body["manifest_enc"], enc, "e2e head served verbatim");
 }
 
 /// §24 pool GC on an e2e workspace, committed entirely through the e2e
@@ -4089,7 +3413,7 @@ async fn e2e_snapshot_commit_get_and_force_checkpoint() {
 /// the hourly timer.
 #[tokio::test]
 async fn pool_gc_collects_unreferenced_e2e_chunks_and_keeps_pinned_ones() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     create_ws_e2e_as(&relay, TOKEN, "ws-e2e", "sealed", None).await;
     let old = upload_chunk(&relay, "ws-e2e", b"superseded ciphertext").await;
     let snapped = upload_chunk(&relay, "ws-e2e", b"snapshotted ciphertext").await;
@@ -4098,10 +3422,8 @@ async fn pool_gc_collects_unreferenced_e2e_chunks_and_keeps_pinned_ones() {
     let stray = upload_chunk(&relay, "ws-e2e", b"never committed ciphertext").await;
     let enc = fake_manifest_enc();
 
-    let lease = acquire(&relay, "ws-e2e", "laptop-a").await;
-    let generation = lease["generation"].as_i64().unwrap();
     // seq 1 references `old`; a named snapshot references `snapped`.
-    let resp = put_head_enc(&relay, "ws-e2e", 0, &enc, std::slice::from_ref(&old), "laptop-a", generation).await;
+    let resp = put_head_enc(&relay, "ws-e2e", 0, &enc, std::slice::from_ref(&old), "laptop-a").await;
     assert_eq!(resp.status(), 200);
     let resp = relay
         .post("/v1/workspaces/ws-e2e/snapshots")
@@ -4119,7 +3441,6 @@ async fn pool_gc_collects_unreferenced_e2e_chunks_and_keeps_pinned_ones() {
             &enc,
             std::slice::from_ref(&current),
             "laptop-a",
-            generation,
         )
         .await;
         assert_eq!(resp.status(), 200, "head {} superseded", base + 1);
@@ -4154,7 +3475,7 @@ async fn pool_gc_collects_unreferenced_e2e_chunks_and_keeps_pinned_ones() {
 
 #[tokio::test]
 async fn user_key_registration_requires_a_signed_bundle() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     let jane = create_user(&relay, "jane").await;
     let bob = create_user(&relay, "bob").await;
     let bundle = signed_bundle("jane");
@@ -4298,7 +3619,7 @@ async fn user_key_registration_requires_a_signed_bundle() {
 
 #[tokio::test]
 async fn wrapped_keys_put_get_me_and_visibility_rules() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     let owner = create_user(&relay, "owner").await;
     let jane = create_user(&relay, "jane").await;
     let rita = create_user(&relay, "rita").await;
@@ -4423,7 +3744,7 @@ async fn wrapped_keys_put_get_me_and_visibility_rules() {
 
 #[tokio::test]
 async fn wrapped_keys_delete_gate_and_idempotency() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     let owner = create_user(&relay, "owner").await;
     let jane = create_user(&relay, "jane").await;
     let rita = create_user(&relay, "rita").await;
@@ -4497,7 +3818,7 @@ async fn wrapped_keys_delete_gate_and_idempotency() {
 
 #[tokio::test]
 async fn team_members_list_carries_registered_key_bundles() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     let owner = create_user(&relay, "owner").await;
     let jane = create_user(&relay, "jane").await;
     let team = create_team(&relay, &owner, "acme").await;
@@ -4540,7 +3861,7 @@ async fn team_members_list_carries_registered_key_bundles() {
 
 #[tokio::test]
 async fn team_remove_member_gate_last_owner_and_wrap_cascade() {
-    let relay = start_relay(300).await;
+    let relay = start_relay().await;
     let owner = create_user(&relay, "owner").await;
     let bob = create_user(&relay, "bob").await;
     let carol = create_user(&relay, "carol").await;

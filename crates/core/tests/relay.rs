@@ -50,7 +50,7 @@ impl MockRelay {
         Self { addr, requests }
     }
 
-    /// A stateful §11 relay: global chunk pool, CAS head, one-holder lease.
+    /// A stateful §11/§32 relay: global chunk pool, CAS head, no lease.
     fn start_stateful() -> (Self, Arc<Mutex<RelayState>>) {
         let state = Arc::new(Mutex::new(RelayState::default()));
         let shared = state.clone();
@@ -66,8 +66,6 @@ struct RelayState {
     /// (hash, manifest, manifest_enc) — exactly one of the latter two is
     /// set, per the workspace's e2e flag (§17).
     head: Option<(String, serde_json::Value, Option<String>)>,
-    generation: u64,
-    holder: Option<String>,
     snapshots: Vec<SnapshotRow>,
     /// Workspace id -> name, recorded on create (for §13 name resolution).
     workspaces: HashMap<String, String>,
@@ -179,11 +177,6 @@ fn route(state: &Arc<Mutex<RelayState>>, head: &str, body: &[u8]) -> (u16, Vec<u
                     "head_seq": st.head_seq,
                     "head_hash": st.head.as_ref().map(|(h, _, _)| h),
                     "e2e": st.e2e,
-                    "lease": st.holder.as_ref().map(|h| serde_json::json!({
-                        "holder": h,
-                        "generation": st.generation,
-                        "expires_at": 4_102_444_800u64,
-                    })),
                 }),
             ),
             None => json(404, serde_json::json!({ "error": "no such workspace" })),
@@ -220,11 +213,6 @@ fn route(state: &Arc<Mutex<RelayState>>, head: &str, body: &[u8]) -> (u16, Vec<u
                 "head_seq": st.head_seq,
                 "head_hash": st.head.as_ref().map(|(h, _, _)| h),
                 "e2e": st.e2e,
-                "lease": st.holder.as_ref().map(|h| serde_json::json!({
-                    "holder": h,
-                    "generation": st.generation,
-                    "expires_at": 4_102_444_800u64,
-                })),
             }),
         ),
         ("PUT", ["chunks", hash]) => {
@@ -321,15 +309,10 @@ fn route(state: &Arc<Mutex<RelayState>>, head: &str, body: &[u8]) -> (u16, Vec<u
             if body["base_seq"].as_u64().unwrap() != st.head_seq {
                 return json(409, serde_json::json!({ "current_seq": st.head_seq }));
             }
-            let device = header(head, "x-pear-device").unwrap_or_default();
-            let generation: u64 = header(head, "x-pear-generation")
-                .and_then(|g| g.parse().ok())
-                .unwrap_or(0);
-            if Some(device.as_str()) != st.holder.as_deref() || generation != st.generation {
-                return json(
-                    403,
-                    serde_json::json!({ "error": "fenced", "fenced": true }),
-                );
+            // §32: the device header is attribution only — required,
+            // never authorizing. The CAS above is the whole contract.
+            if header(head, "x-pear-device").is_none() {
+                return json(403, serde_json::json!({ "error": "missing X-Pear-Device" }));
             }
             st.head_seq += 1;
             // §17: an e2e commit carries manifest_enc (stored verbatim;
@@ -345,44 +328,6 @@ fn route(state: &Arc<Mutex<RelayState>>, head: &str, body: &[u8]) -> (u16, Vec<u
                 .to_string();
             st.head = Some((hash.clone(), manifest, None));
             json(200, serde_json::json!({ "seq": st.head_seq, "hash": hash }))
-        }
-        ("POST", ["lease", "acquire"]) => {
-            let body: serde_json::Value = serde_json::from_slice(body).unwrap();
-            let device = body["device_id"].as_str().unwrap().to_string();
-            if st.holder.as_deref() == Some(device.as_str()) {
-                return json(200, lease_json(&st));
-            }
-            if st.holder.is_some() {
-                return json(
-                    409,
-                    serde_json::json!({ "holder": st.holder, "expires_at": 4_102_444_800u64 }),
-                );
-            }
-            st.generation += 1;
-            st.holder = Some(device);
-            json(200, lease_json(&st))
-        }
-        ("POST", ["lease", "heartbeat"]) => {
-            let body: serde_json::Value = serde_json::from_slice(body).unwrap();
-            let device = body["device_id"].as_str().unwrap();
-            let generation = body["generation"].as_u64().unwrap();
-            if st.holder.as_deref() == Some(device) && generation == st.generation {
-                json(200, serde_json::json!({ "expires_at": 4_102_444_800u64 }))
-            } else {
-                json(
-                    403,
-                    serde_json::json!({ "error": "fenced", "fenced": true }),
-                )
-            }
-        }
-        ("POST", ["lease", "transfer"]) | ("POST", ["lease", "force"]) => {
-            let body: serde_json::Value = serde_json::from_slice(body).unwrap();
-            let device = body["device_id"].as_str().unwrap().to_string();
-            if st.holder.as_deref() != Some(device.as_str()) {
-                st.generation += 1;
-                st.holder = Some(device);
-            }
-            json(200, serde_json::json!({ "generation": st.generation }))
         }
         ("POST", ["snapshots"]) => {
             let body: serde_json::Value = serde_json::from_slice(body).unwrap();
@@ -434,10 +379,6 @@ fn route(state: &Arc<Mutex<RelayState>>, head: &str, body: &[u8]) -> (u16, Vec<u
         }
         _ => json(404, serde_json::json!({ "error": "no route" })),
     }
-}
-
-fn lease_json(st: &RelayState) -> serde_json::Value {
-    serde_json::json!({ "generation": st.generation, "expires_at": 4_102_444_800u64 })
 }
 
 /// Extract a header value from the raw request head.
@@ -497,18 +438,14 @@ fn prng_bytes(mut seed: u64, n: usize) -> Vec<u8> {
 // ---------- tests ----------
 
 #[test]
-fn client_error_mapping_and_lease_headers() {
+fn client_error_mapping_and_head_headers() {
     let (mock, _state) = MockRelay::start_stateful();
     let ws = "ws-1";
     let a = client(&mock, ws, "device-a");
 
-    // No lease acquired: put_head refuses locally, no HTTP involved.
+    // §32: no lease to acquire — a head commit is just the CAS.
     let manifest = Manifest::new(ws.to_string());
-    let err = a.put_head(0, &manifest).unwrap_err();
-    assert!(matches!(err, RelayError::Fenced(_)), "got {err:?}");
-
     a.create_workspace("ws").unwrap();
-    assert_eq!(a.acquire().unwrap(), 1);
     let commit = a.put_head(0, &manifest).unwrap();
     assert_eq!(commit.seq, 1);
 
@@ -519,29 +456,24 @@ fn client_error_mapping_and_lease_headers() {
         "got {err:?}"
     );
 
-    // A second device cannot acquire while the first holds the lease.
+    // A second device with the right base_seq simply commits: concurrent
+    // writers are legal, and the CAS is the only serialization.
     let b = client(&mock, ws, "device-b");
-    let err = b.acquire().unwrap_err();
-    match err {
-        RelayError::LeaseHeld { holder, expires_at } => {
-            assert_eq!(holder, "device-a");
-            assert!(expires_at.is_some());
-        }
-        other => panic!("expected LeaseHeld, got {other:?}"),
-    }
-
-    // Force-take by B fences A: A's next head commit is a typed 403.
-    assert_eq!(b.force().unwrap(), 2);
+    assert_eq!(b.put_head(1, &manifest).unwrap().seq, 2);
+    // ...and the first device now loses the CAS, not a fencing check.
     let err = a.put_head(1, &manifest).unwrap_err();
-    assert!(matches!(err, RelayError::Fenced(_)), "got {err:?}");
+    assert!(
+        matches!(err, RelayError::HeadConflict { current_seq: 2 }),
+        "got {err:?}"
+    );
 
     // 404 maps to NotFound; ChunkSource surfaces it as ErrorKind::NotFound.
     let missing = blake3::hash(b"nope").to_hex().to_string();
     let err = ChunkSource::get(&a, &missing).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
 
-    // Every request carried the bearer token; the head commits carried the
-    // lease headers.
+    // Every request carried the bearer token; head commits carry the
+    // device attribution header and NOTHING else (§32: no generation).
     let requests = mock.requests.lock().unwrap();
     assert!(!requests.is_empty());
     for head in requests.iter() {
@@ -554,14 +486,16 @@ fn client_error_mapping_and_lease_headers() {
         .iter()
         .filter(|h| h.starts_with("PUT /v1/workspaces/ws-1/head "))
         .collect();
-    assert_eq!(put_heads.len(), 3);
+    assert_eq!(put_heads.len(), 4);
     assert_eq!(
         header(put_heads[0], "x-pear-device").as_deref(),
         Some("device-a")
     );
-    assert_eq!(
-        header(put_heads[0], "x-pear-generation").as_deref(),
-        Some("1")
+    assert!(
+        put_heads
+            .iter()
+            .all(|h| header(h, "x-pear-generation").is_none()),
+        "the fencing header is gone (§32)"
     );
 }
 
@@ -627,7 +561,6 @@ fn push_and_pull_use_the_batched_chunk_endpoints() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace("a").unwrap();
-    a.acquire().unwrap();
     let report = push_cycle(&dir_a, &a, 0, false).unwrap();
     assert_eq!(report.chunks_uploaded, 2);
 
@@ -689,7 +622,6 @@ fn pull_splits_get_many_by_the_byte_budget() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace("a").unwrap();
-    a.acquire().unwrap();
     push_cycle(&dir_a, &a, 0, false).unwrap();
 
     let (_meta_b, _) = pear_core::init_workspace(&dir_b, Some(&meta.id)).unwrap();
@@ -737,7 +669,6 @@ fn push_pull_converges_and_idles() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace("a").unwrap();
-    a.acquire().unwrap();
     let report = push_cycle(&dir_a, &a, 0, false).unwrap();
     assert!(report.committed);
     assert_eq!(report.head_seq, 1);
@@ -828,7 +759,6 @@ fn pull_sweeps_superseded_chunks() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace("a").unwrap();
-    a.acquire().unwrap();
     push_cycle(&dir_a, &a, 0, false).unwrap();
 
     let (_meta_b, _) = pear_core::init_workspace(&dir_b, Some(&meta.id)).unwrap();
@@ -854,25 +784,37 @@ fn pull_sweeps_superseded_chunks() {
     assert_eq!(store_chunk_names(&store_root), after);
 }
 
+/// §32: a device whose `base_seq` is behind loses the CAS — that is a
+/// retryable `HeadConflict`, not a fatal fence, and the winner's commit
+/// is untouched.
 #[test]
-fn fenced_second_device_cannot_push() {
+fn a_stale_base_seq_loses_the_cas_not_the_workspace() {
     let (mock, _state) = MockRelay::start_stateful();
     let tmp = tempfile::tempdir().unwrap();
     let dir_a = tmp.path().join("a");
+    let dir_b = tmp.path().join("b");
     std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
     write(&dir_a, "f.txt", b"v1\n");
+    write(&dir_b, "g.txt", b"v1\n");
 
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
-    let stale = client(&mock, &meta.id, "device-stale");
-    stale.create_workspace("a").unwrap();
-    stale.acquire().unwrap();
-
-    // Another device force-takes the lease; the stale holder is fenced.
+    pear_core::init_workspace(&dir_b, Some(&meta.id)).unwrap();
     let winner = client(&mock, &meta.id, "device-winner");
-    winner.force().unwrap();
+    let straggler = client(&mock, &meta.id, "device-straggler");
+    winner.create_workspace("a").unwrap();
 
-    let err = push_cycle(&dir_a, &stale, 0, false).unwrap_err();
-    assert!(matches!(err, PushError::Fenced(_)), "got {err:?}");
+    assert_eq!(push_cycle(&dir_a, &winner, 0, false).unwrap().head_seq, 1);
+    let err = push_cycle(&dir_b, &straggler, 0, false).unwrap_err();
+    assert!(
+        matches!(err, PushError::HeadConflict { current_seq: 1 }),
+        "got {err:?}"
+    );
+    // Rebased onto the winner's seq, the same device commits fine.
+    assert_eq!(
+        push_cycle(&dir_b, &straggler, 1, false).unwrap().head_seq,
+        2
+    );
 }
 
 #[test]
@@ -887,7 +829,6 @@ fn writer_commit_gate_survives_local_sync_cache_poisoning() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace("a").unwrap();
-    a.acquire().unwrap();
     let first = push_cycle(&dir_a, &a, 0, false).unwrap();
     assert!(first.committed && first.head_seq == 1);
 
@@ -914,7 +855,7 @@ fn resolve_workspace_percent_encodes_names() {
             return json(
                 200,
                 serde_json::json!({
-                    "id": "ws1", "name": "my ws", "head_seq": 0, "head_hash": null, "lease": null,
+                    "id": "ws1", "name": "my ws", "head_seq": 0, "head_hash": null,
                 }),
             );
         }
@@ -962,7 +903,7 @@ fn client_percent_encodes_workspace_ids_in_urls() {
             return json(
                 200,
                 serde_json::json!({
-                    "id": "x/head", "name": "w", "head_seq": 0, "head_hash": null, "lease": null,
+                    "id": "x/head", "name": "w", "head_seq": 0, "head_hash": null,
                 }),
             );
         }
@@ -1029,37 +970,6 @@ fn pull_requires_the_remote_workspace_id() {
     );
 }
 
-#[test]
-fn transfer_reports_holder_on_rejection() {
-    // A minimal mock whose transfer always 409s with holder info.
-    let mock = MockRelay::start(Arc::new(|head, _body| {
-        if head.starts_with("GET /v1/workspaces/ws-9 ") {
-            return json(
-                200,
-                serde_json::json!({
-                    "id": "ws-9", "name": "w", "head_seq": 4, "head_hash": null, "lease": {
-                        "holder": "device-a", "generation": 7, "expires_at": "2099-01-01T00:00:00Z"
-                    }
-                }),
-            );
-        }
-        json(
-            409,
-            serde_json::json!({ "holder": "device-a", "expires_at": "2099-01-01T00:00:00Z" }),
-        )
-    }));
-    let c = client(&mock, "ws-9", "device-b");
-    let err = c.transfer(4).unwrap_err();
-    let msg = format!("{err}");
-    match err {
-        RelayError::TransferRejected { holder, expires_at } => {
-            assert_eq!(holder.as_deref(), Some("device-a"));
-            assert_eq!(expires_at.as_deref(), Some("2099-01-01T00:00:00Z"));
-            assert!(msg.contains("device-a"), "{msg}");
-        }
-        other => panic!("expected TransferRejected, got {other:?}"),
-    }
-}
 
 #[test]
 fn pull_rejects_chunk_bytes_that_do_not_match_their_hash() {
@@ -1073,7 +983,6 @@ fn pull_rejects_chunk_bytes_that_do_not_match_their_hash() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace("a").unwrap();
-    a.acquire().unwrap();
     push_cycle(&dir_a, &a, 0, false).unwrap();
 
     // Poison the relay pool: the head references the chunk, but the pool
@@ -1107,10 +1016,9 @@ fn last_applied_seq_tracks_pulls() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace("a").unwrap();
-    a.acquire().unwrap();
     push_cycle(&dir_a, &a, 0, false).unwrap();
 
-    // Nothing applied yet: no proof to offer at checkout.
+    // Nothing applied yet: the mirror has no recorded head.
     assert_eq!(pear_core::sync::last_applied_seq(&dir_b), None);
     let (_meta_b, _) = pear_core::init_workspace(&dir_b, Some(&meta.id)).unwrap();
     let b = client(&mock, &meta.id, "device-b");
@@ -1130,7 +1038,6 @@ fn writer_base_seq_refuses_a_silent_rewind() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace("a").unwrap();
-    a.acquire().unwrap();
     push_cycle(&dir_a, &a, 0, false).unwrap();
     // A commit persists the writer's known head for restarts.
     assert_eq!(pear_core::sync::last_applied_seq(&dir_a), Some(1));
@@ -1202,7 +1109,6 @@ fn forced_takeover_commits_even_when_tree_is_unchanged() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace("a").unwrap();
-    a.acquire().unwrap();
     push_cycle(&dir_a, &a, 0, false).unwrap();
 
     let (_m, _) = pear_core::init_workspace(&dir_b, Some(&meta.id)).unwrap();
@@ -1216,7 +1122,6 @@ fn forced_takeover_commits_even_when_tree_is_unchanged() {
     // B force-takes with an unchanged (stale) tree: the takeover contract
     // is "this tree becomes the head" — the first push must commit even
     // though nothing changed locally.
-    b.force().unwrap();
     let base = pear_core::sync::writer_base_seq(&dir_b, &b, true).unwrap();
     assert_eq!(base, 2);
     let report = push_cycle(&dir_b, &b, base, true).unwrap();
@@ -1264,7 +1169,6 @@ fn lost_commit_response_recovers_instead_of_self_fencing() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace("a").unwrap();
-    a.acquire().unwrap();
     push_cycle(&dir_a, &a, 0, false).unwrap();
     write(&dir_a, "f.txt", b"v2\n");
 
@@ -1287,7 +1191,6 @@ fn pull_once_initializes_fresh_mirror_with_client_workspace_id() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace("a").unwrap();
-    a.acquire().unwrap();
     push_cycle(&dir_a, &a, 0, false).unwrap();
 
     // No init on the mirror dir: pull_once must adopt the client's
@@ -1320,7 +1223,6 @@ fn relay_client_error_is_fatal_not_retryable() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace("a").unwrap();
-    a.acquire().unwrap();
     let err = push_cycle(&dir_a, &a, 0, false).unwrap_err();
     assert!(
         matches!(err, PushError::Client(_)),
@@ -1348,7 +1250,6 @@ fn transient_4xx_stays_retryable() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace("a").unwrap();
-    a.acquire().unwrap();
     let err = push_cycle(&dir_a, &a, 0, false).unwrap_err();
     assert!(
         matches!(err, PushError::Other(_)),
@@ -1407,7 +1308,6 @@ fn mirror_records_masked_modes_and_stays_idle() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace("a").unwrap();
-    a.acquire().unwrap();
     push_cycle(&dir_a, &a, 0, false).unwrap();
 
     let dir_b = tmp.path().join("b");
@@ -1525,7 +1425,6 @@ fn refused_clone_leaves_the_target_untouched() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace("a").unwrap();
-    a.acquire().unwrap();
     push_cycle(&dir_a, &a, 0, false).unwrap();
     let snap = pear_core::snapshot::push_snapshot(&dir_a, &a, None).unwrap();
 
@@ -1562,7 +1461,6 @@ fn snapshot_does_not_poison_the_next_push() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace("a").unwrap();
-    a.acquire().unwrap();
     push_cycle(&dir_a, &a, 0, false).unwrap();
 
     // Edit, snapshot (the preserve-first step), then resume the writer:
@@ -1656,7 +1554,6 @@ fn clone_refuses_a_non_empty_target() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace("a").unwrap();
-    a.acquire().unwrap();
     push_cycle(&dir_a, &a, 0, false).unwrap();
     let snap = pear_core::snapshot::push_snapshot(&dir_a, &a, None).unwrap();
 
@@ -1724,7 +1621,6 @@ fn lost_commit_recovery_works_across_cycles_with_fresh_timestamps() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace("a").unwrap();
-    a.acquire().unwrap();
     push_cycle(&dir_a, &a, 0, false).unwrap();
 
     // Simulate the commit whose response was lost last cycle: the relay
@@ -1760,7 +1656,6 @@ fn freshness_checks_compare_hash_not_just_seq() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace("a").unwrap();
-    a.acquire().unwrap();
     push_cycle(&dir_a, &a, 0, false).unwrap();
 
     let (_m, _) = pear_core::init_workspace(&dir_b, Some(&meta.id)).unwrap();
@@ -1872,7 +1767,6 @@ fn snapshot_captures_unsynced_state_ahead_and_behind_head() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace("a").unwrap();
-    a.acquire().unwrap();
     push_cycle(&dir_a, &a, 0, false).unwrap(); // head = v1
 
     // The local tree moves AHEAD of the head (unsynced edit + new file).
@@ -1900,7 +1794,6 @@ fn snapshot_captures_unsynced_state_ahead_and_behind_head() {
     let dir_b = tmp.path().join("b");
     pear_core::init_workspace(&dir_b, Some(&meta.id)).unwrap();
     let b = client(&mock, &meta.id, "device-b");
-    b.force().unwrap();
     write(&dir_b, "f.txt", b"v3-from-b\n");
     let pushed = push_cycle(&dir_b, &b, 1, true).unwrap();
     assert!(pushed.committed);
@@ -2084,7 +1977,6 @@ fn resolve_team_name_then_mirror_once_converges() {
     owner
         .create_workspace_with_team("api", Some("team-1"))
         .unwrap();
-    owner.acquire().unwrap();
     let pushed = push_cycle(&dir_a, &owner, 0, false).unwrap();
     assert!(pushed.committed);
 
@@ -2111,7 +2003,9 @@ fn resolve_team_name_then_mirror_once_converges() {
 
 #[test]
 fn chunk_path_auth_failures_are_fatal_not_retryable() {
-    // 401 and 403 on the chunk data path must both go fatal, not retry.
+    // 401 and 403 on the chunk data path must both go fatal, not retry
+    // (§32 types 403 apart as `Forbidden` so the converge loop can
+    // degrade to a read-only mirror on it).
     for status in [401u16, 403] {
         let state = Arc::new(Mutex::new(RelayState::default()));
         let shared = state.clone();
@@ -2130,10 +2024,9 @@ fn chunk_path_auth_failures_are_fatal_not_retryable() {
         let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
         let a = client(&mock, &meta.id, "device-a");
         a.create_workspace("a").unwrap();
-        a.acquire().unwrap();
         let err = push_cycle(&dir_a, &a, 0, false).unwrap_err();
         assert!(
-            matches!(err, PushError::Client(_)),
+            matches!(err, PushError::Client(_) | PushError::Forbidden(_)),
             "HTTP {status} on the chunk path must be fatal, got {err:?}"
         );
     }
@@ -2150,7 +2043,6 @@ fn unchanged_tree_still_repairs_a_lossy_chunk_pool() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace("a").unwrap();
-    a.acquire().unwrap();
     push_cycle(&dir_a, &a, 0, false).unwrap();
 
     // The relay loses its chunk pool (the head log survives): the next
@@ -2179,7 +2071,6 @@ fn idle_mirror_polls_do_not_download_the_manifest() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace("a").unwrap();
-    a.acquire().unwrap();
     push_cycle(&dir_a, &a, 0, false).unwrap();
 
     let (_m, _) = pear_core::init_workspace(&dir_b, Some(&meta.id)).unwrap();
@@ -2245,7 +2136,6 @@ fn pull_errors_loudly_when_a_wiped_relay_loses_the_head() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace("a").unwrap();
-    a.acquire().unwrap();
     push_cycle(&dir_a, &a, 0, false).unwrap();
 
     let dir_b = tmp.path().join("b");
@@ -2277,7 +2167,6 @@ fn pull_marks_corrupt_local_manifest_fatal_not_retryable() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace("a").unwrap();
-    a.acquire().unwrap();
     push_cycle(&dir_a, &a, 0, false).unwrap();
 
     let dir_b = tmp.path().join("b");
@@ -2337,7 +2226,6 @@ fn e2e_push_pull_converges_over_mock_and_plaintext_stays_local() {
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace_e2e("a", None).unwrap();
     assert!(a.get_workspace().unwrap().e2e);
-    a.acquire().unwrap();
     let keyring = pear_core::e2e::load_or_create_workspace_keyring(&dir_a).unwrap();
     let pushed = pear_core::sync::push_cycle_e2e(&dir_a, &a, 0, false, &keyring).unwrap();
     assert!(pushed.committed);
@@ -2426,7 +2314,6 @@ fn e2e_lost_commit_response_recovers_by_decrypting_the_head() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace_e2e("a", None).unwrap();
-    a.acquire().unwrap();
     let keyring = pear_core::e2e::load_or_create_workspace_keyring(&dir_a).unwrap();
     pear_core::sync::push_cycle_e2e(&dir_a, &a, 0, false, &keyring).unwrap();
     write(&dir_a, "f.txt", b"v2\n");
@@ -2452,7 +2339,6 @@ fn e2e_pull_rejects_tampered_ciphertext() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace_e2e("a", None).unwrap();
-    a.acquire().unwrap();
     let keyring = pear_core::e2e::load_or_create_workspace_keyring(&dir_a).unwrap();
     pear_core::sync::push_cycle_e2e(&dir_a, &a, 0, false, &keyring).unwrap();
 
@@ -2541,7 +2427,6 @@ fn writer_refuses_dotenv_cycle_when_team_forbids() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace("a").unwrap();
-    a.acquire().unwrap();
     a.set_env_sync_policy(Some("acme".to_string()));
 
     let err = push_cycle(&dir_a, &a, 0, false).unwrap_err();
@@ -2596,7 +2481,6 @@ fn writer_without_dotenv_pushes_normally_under_forbidding_team() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace("a").unwrap();
-    a.acquire().unwrap();
     a.set_env_sync_policy(Some("acme".to_string()));
 
     let report = push_cycle(&dir_a, &a, 0, false).unwrap();
@@ -2619,7 +2503,6 @@ fn e2e_writer_refuses_dotenv_cycle_when_team_forbids() {
     let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
     let a = client(&mock, &meta.id, "device-a");
     a.create_workspace_e2e("a", None).unwrap();
-    a.acquire().unwrap();
     let keyring = pear_core::e2e::load_or_create_workspace_keyring(&dir_a).unwrap();
     a.set_env_sync_policy(Some("acme".to_string()));
 
@@ -2634,4 +2517,309 @@ fn e2e_writer_refuses_dotenv_cycle_when_team_forbids() {
         !requests.iter().any(|r| r.contains("chunks")),
         "nothing uploads when the cycle refuses: {requests:?}"
     );
+}
+
+// ---------- §32 converge (multi-writer) ----------
+
+/// A converging writer (§32): register the workspace and hand back a
+/// client. Nothing is acquired — every Writer device may commit whenever
+/// the CAS lets it.
+fn converge_writer(mock: &MockRelay, dir: &Path, ws: &str, device: &str) -> RelayClient {
+    std::fs::create_dir_all(dir).unwrap();
+    let c = client(mock, ws, device);
+    c.create_workspace("ws").unwrap();
+    c
+}
+
+fn converge(dir: &Path, c: &RelayClient, device: &str) -> pear_core::converge::ConvergeReport {
+    pear_core::converge::converge_once(dir, c, device, None).unwrap()
+}
+
+fn set_mtime(dir: &Path, rel: &str, secs: i64) {
+    filetime::set_file_mtime(dir.join(rel), filetime::FileTime::from_unix_time(secs, 0)).unwrap();
+}
+
+/// The (hash, bytes) of a payload small enough to be exactly one chunk.
+fn one_chunk(data: &[u8]) -> (String, Vec<u8>) {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), data).unwrap();
+    let mut chunks: Vec<(String, Vec<u8>)> = pear_core::chunk::chunk_file(tmp.path())
+        .unwrap()
+        .map(|c| {
+            let c = c.unwrap();
+            (c.hash, c.data)
+        })
+        .collect();
+    assert_eq!(chunks.len(), 1, "fixture must be a single chunk");
+    chunks.pop().unwrap()
+}
+
+#[test]
+fn converge_publishes_a_fresh_tree_then_idles() {
+    let (mock, _state) = MockRelay::start_stateful();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir_a = tmp.path().join("a");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
+    let a = converge_writer(&mock, &dir_a, &meta.id, "device-a");
+    write(&dir_a, "src/main.rs", b"fn main() {}\n");
+
+    let report = converge(&dir_a, &a, "device-a");
+    assert!(report.pushed);
+    assert_eq!(report.head_seq, 1);
+    assert_eq!(report.attempts, 1);
+    assert!(report.conflict_copies.is_empty());
+    assert_eq!(pear_core::sync::last_applied_seq(&dir_a), Some(1));
+
+    let head = a.get_head().unwrap().unwrap();
+    assert!(head.manifest.files.contains_key("src/main.rs"));
+
+    // Nothing moved: the second converge neither pushes nor bumps the seq.
+    let report = converge(&dir_a, &a, "device-a");
+    assert!(!report.pushed, "an unchanged tree must not bump the head");
+    assert_eq!(report.head_seq, 1);
+}
+
+/// Two writers editing disjoint files converge with both edits (§32).
+#[test]
+fn two_writers_converge_with_both_edits() {
+    let (mock, _state) = MockRelay::start_stateful();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir_a = tmp.path().join("a");
+    let dir_b = tmp.path().join("b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
+    let a = converge_writer(&mock, &dir_a, &meta.id, "device-a");
+    write(&dir_a, "a.txt", b"from a\n");
+    assert!(converge(&dir_a, &a, "device-a").pushed);
+
+    // B joins into an empty directory: its first converge materializes the
+    // tree and publishes its own file in the same pass.
+    let b = converge_writer(&mock, &dir_b, &meta.id, "device-b");
+    write(&dir_b, "b.txt", b"from b\n");
+    let report = converge(&dir_b, &b, "device-b");
+    assert!(report.pushed);
+    assert_eq!(report.written, vec!["a.txt"]);
+    assert!(report.conflict_copies.is_empty());
+
+    // A converges onto B's head and picks up b.txt.
+    let report = converge(&dir_a, &a, "device-a");
+    assert_eq!(report.written, vec!["b.txt"]);
+    assert!(!report.pushed, "A had nothing of its own to publish");
+    assert_eq!(tree(&dir_a), tree(&dir_b), "both devices end identical");
+    assert_eq!(tree(&dir_a).len(), 2);
+}
+
+/// The same file edited on both devices: LWW picks one winner and the
+/// loser survives as a conflict copy — on BOTH devices, byte-identically.
+#[test]
+fn conflicting_edits_end_with_the_same_conflict_copy_everywhere() {
+    let (mock, _state) = MockRelay::start_stateful();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir_a = tmp.path().join("a");
+    let dir_b = tmp.path().join("b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
+    let a = converge_writer(&mock, &dir_a, &meta.id, "device-a");
+    write(&dir_a, "notes.txt", b"shared\n");
+    set_mtime(&dir_a, "notes.txt", 1_700_000_000);
+    assert!(converge(&dir_a, &a, "device-a").pushed);
+
+    let b = converge_writer(&mock, &dir_b, &meta.id, "device-b");
+    assert!(!converge(&dir_b, &b, "device-b").pushed, "B only catches up");
+    assert_eq!(std::fs::read(dir_b.join("notes.txt")).unwrap(), b"shared\n");
+
+    // Both edit the same file offline; B's edit is the newer one.
+    write(&dir_a, "notes.txt", b"from a\n");
+    set_mtime(&dir_a, "notes.txt", 1_700_000_100);
+    write(&dir_b, "notes.txt", b"from b\n");
+    set_mtime(&dir_b, "notes.txt", 1_700_000_200);
+
+    // A publishes first: only A moved since its base, so no conflict.
+    let report = converge(&dir_a, &a, "device-a");
+    assert!(report.pushed && report.conflict_copies.is_empty());
+
+    // B merges: its newer edit wins the path, A's becomes the copy.
+    let report = converge(&dir_b, &b, "device-b");
+    assert!(report.pushed);
+    assert_eq!(report.conflict_copies.len(), 1, "{report:?}");
+    let copy = report.conflict_copies[0].clone();
+    assert!(copy.starts_with("notes (conflict from remote "), "{copy}");
+    assert!(copy.ends_with(".txt"), "{copy}");
+    assert_eq!(std::fs::read(dir_b.join("notes.txt")).unwrap(), b"from b\n");
+    assert_eq!(std::fs::read(dir_b.join(&copy)).unwrap(), b"from a\n");
+
+    // A converges onto that head: same winner, same copy, no new conflict.
+    let report = converge(&dir_a, &a, "device-a");
+    assert!(report.conflict_copies.is_empty(), "{report:?}");
+    assert_eq!(tree(&dir_a), tree(&dir_b), "both devices end identical");
+    assert_eq!(std::fs::read(dir_a.join(&copy)).unwrap(), b"from a\n");
+}
+
+/// Delete on one device, edit on the other: the edit wins both ways (§32).
+#[test]
+fn converge_delete_versus_edit_both_directions() {
+    let (mock, _state) = MockRelay::start_stateful();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir_a = tmp.path().join("a");
+    let dir_b = tmp.path().join("b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
+    let a = converge_writer(&mock, &dir_a, &meta.id, "device-a");
+    write(&dir_a, "keep.txt", b"v1\n");
+    write(&dir_a, "drop.txt", b"v1\n");
+    converge(&dir_a, &a, "device-a");
+    let b = converge_writer(&mock, &dir_b, &meta.id, "device-b");
+    converge(&dir_b, &b, "device-b");
+
+    // A deletes `keep.txt`; B edits it. The edit wins and restores it.
+    std::fs::remove_file(dir_a.join("keep.txt")).unwrap();
+    converge(&dir_a, &a, "device-a");
+    write(&dir_b, "keep.txt", b"v2\n");
+    let report = converge(&dir_b, &b, "device-b");
+    assert!(report.pushed && report.conflict_copies.is_empty());
+    converge(&dir_a, &a, "device-a");
+    assert_eq!(
+        std::fs::read(dir_a.join("keep.txt")).unwrap(),
+        b"v2\n",
+        "an edit restores a file the other device deleted"
+    );
+
+    // The other direction: B deletes `drop.txt` with nobody editing it, so
+    // the delete propagates.
+    std::fs::remove_file(dir_b.join("drop.txt")).unwrap();
+    converge(&dir_b, &b, "device-b");
+    let report = converge(&dir_a, &a, "device-a");
+    assert_eq!(report.deleted, vec!["drop.txt"]);
+    assert!(!dir_a.join("drop.txt").exists());
+    assert_eq!(tree(&dir_a), tree(&dir_b));
+}
+
+/// A lost CAS race re-merges against the head that won and retries (§32
+/// step 5) instead of failing the cycle.
+#[test]
+fn converge_rebases_onto_a_head_that_won_the_cas_race() {
+    let state = Arc::new(Mutex::new(RelayState::default()));
+    let shared = state.clone();
+    // Armed below: the next `PUT /head` finds the head already advanced by
+    // "another writer" and 409s, exactly like a real lost race.
+    let interloper: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let armed = interloper.clone();
+    let mock = MockRelay::start(Arc::new(move |head, body| {
+        let line = head.lines().next().unwrap_or("");
+        if line.starts_with("PUT ") && line.contains("/head") {
+            if let Some(manifest) = armed.lock().unwrap().take() {
+                let mut st = shared.lock().unwrap();
+                st.head_seq += 1;
+                let hash = blake3::hash(&serde_json::to_vec(&manifest).unwrap())
+                    .to_hex()
+                    .to_string();
+                st.head = Some((hash, manifest, None));
+            }
+        }
+        route(&shared, head, body)
+    }));
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir_a = tmp.path().join("a");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
+    let a = converge_writer(&mock, &dir_a, &meta.id, "device-a");
+    write(&dir_a, "a.txt", b"from a\n");
+    assert_eq!(converge(&dir_a, &a, "device-a").head_seq, 1);
+
+    // The competing head is seq 1's plus a file only that writer has.
+    let mut winner = a.get_head().unwrap().unwrap().manifest;
+    let (hash, data) = one_chunk(b"from c\n");
+    a.put_chunk(&hash, &data).unwrap();
+    winner.files.insert(
+        "c.txt".to_string(),
+        pear_core::manifest::FileEntry {
+            size: data.len() as u64,
+            mode: 0o644,
+            mtime_secs: 1_700_000_000,
+            mtime_nanos: 0,
+            chunks: vec![hash],
+        },
+    );
+    *interloper.lock().unwrap() = Some(serde_json::to_value(&winner).unwrap());
+
+    write(&dir_a, "b.txt", b"from b\n");
+    let report = converge(&dir_a, &a, "device-a");
+    assert_eq!(report.attempts, 2, "the 409 costs exactly one re-merge");
+    assert!(report.pushed);
+    assert_eq!(report.head_seq, 3, "seq 2 was the interloper's");
+    assert_eq!(report.written, vec!["c.txt"], "the winner's file is applied");
+    let files = tree(&dir_a);
+    assert_eq!(files.len(), 3, "{files:?}");
+    assert_eq!(files["c.txt"], b"from c\n");
+    assert_eq!(files["b.txt"], b"from b\n");
+}
+
+/// §32 under §17: two writers converge on an e2e workspace. Paths and
+/// bytes never leave the devices in the clear — the head carries only
+/// `manifest_enc` and the pool only ciphertext chunks.
+#[test]
+fn two_e2e_writers_converge_with_both_edits() {
+    let (mock, state) = MockRelay::start_stateful();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir_a = tmp.path().join("a");
+    let dir_b = tmp.path().join("b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
+    let a = client(&mock, &meta.id, "device-a");
+    a.create_workspace_e2e("ws", None).unwrap();
+    let keyring = pear_core::e2e::load_or_create_workspace_keyring(&dir_a).unwrap();
+    write(&dir_a, "a.txt", b"from a\n");
+    let report =
+        pear_core::converge::converge_once(&dir_a, &a, "device-a", Some(&keyring)).unwrap();
+    assert!(report.pushed && report.head_seq == 1);
+
+    // B holds the same workspace key (a `pear join` unwraps it from the
+    // relay; the test plants it directly).
+    std::fs::create_dir_all(dir_b.join(".pear")).unwrap();
+    pear_core::e2e::store_workspace_keyring(&dir_b, &keyring).unwrap();
+    let b = client(&mock, &meta.id, "device-b");
+    write(&dir_b, "b.txt", b"from b\n");
+    let report =
+        pear_core::converge::converge_once(&dir_b, &b, "device-b", Some(&keyring)).unwrap();
+    assert!(report.pushed);
+    assert_eq!(report.written, vec!["a.txt"]);
+    assert_eq!(std::fs::read(dir_b.join("a.txt")).unwrap(), b"from a\n");
+
+    pear_core::converge::converge_once(&dir_a, &a, "device-a", Some(&keyring)).unwrap();
+    assert_eq!(tree(&dir_a), tree(&dir_b));
+
+    // The relay saw ciphertext only: no plaintext head, no plaintext chunk.
+    let st = state.lock().unwrap();
+    let (_, manifest, manifest_enc) = st.head.as_ref().unwrap();
+    assert!(manifest.is_null(), "an e2e head carries no plaintext manifest");
+    assert!(manifest_enc.is_some());
+    for blob in st.chunks.values() {
+        assert!(
+            !blob.windows(6).any(|w| w == b"from a" || w == b"from b"),
+            "a plaintext byte reached the pool"
+        );
+    }
+}
+
+/// Converging an e2e workspace without its key is a deterministic refusal,
+/// not a plaintext head published over an encrypted one (§17 pinning).
+#[test]
+fn converge_refuses_an_e2e_workspace_without_the_key() {
+    let (mock, _state) = MockRelay::start_stateful();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir_a = tmp.path().join("a");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    let (meta, _) = pear_core::init_workspace(&dir_a, None).unwrap();
+    let a = client(&mock, &meta.id, "device-a");
+    a.create_workspace_e2e("ws", None).unwrap();
+    write(&dir_a, "a.txt", b"from a\n");
+
+    let err = pear_core::converge::converge_once(&dir_a, &a, "device-a", None).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("end-to-end encrypted"),
+        "got {err:#}"
+    );
+    assert!(a.get_head().unwrap().is_none(), "nothing was published");
 }

@@ -567,18 +567,17 @@ fn monorepo_baselines() {
     let addr = listener.local_addr().unwrap();
     let data_dir = tmp.path().join("relay-data");
     rt.spawn(async move {
-        pear_relay::serve_on(listener, TOKEN, &data_dir, 300)
+        pear_relay::serve_on(listener, TOKEN, &data_dir)
             .await
             .expect("relay serve failed");
     });
     let url = format!("http://{addr}");
     wait_ready(&url);
 
-    // Writer: init, register, acquire, push the whole tree.
+    // Writer: init, register, push the whole tree.
     let (meta, _) = pear_core::init_workspace(&writer, None).unwrap();
     let w = RelayClient::new(&url, TOKEN, &meta.id, "device-w");
     w.create_workspace("perf5k").unwrap();
-    w.acquire().unwrap();
     let t = Instant::now();
     let pushed = push_cycle(&writer, &w, 0, false).unwrap();
     let push_t = t.elapsed();

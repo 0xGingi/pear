@@ -35,8 +35,8 @@ pub struct SnapshotReport {
 /// Preserve the local tree as a snapshot on the relay (§12): the writer
 /// pipeline (scan -> chunk -> upload only the chunks the relay is missing)
 /// then `POST /snapshots`. Works on any pear workspace regardless of head
-/// state — no lease, no CAS — which is exactly how unsynced state is
-/// preserved before choosing mirror or force.
+/// state — no CAS — which is exactly how unsynced state is preserved on
+/// demand.
 pub fn push_snapshot(
     source: &Path,
     client: &RelayClient,
@@ -108,7 +108,7 @@ fn push_snapshot_inner(
     uploader.flush()?;
     let not_found = || {
         anyhow!(
-            "relay has no workspace {}; create it with `pear watch --relay` first",
+            "relay has no workspace {}; create it with `pear join --relay <url>` first",
             client.workspace_id()
         )
     };

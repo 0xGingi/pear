@@ -69,45 +69,52 @@ mod server {
             }
         }
 
-        /// `add_watch`: validate, spawn the loop thread, persist. A watch is
-        /// either local (target) or a writer (relay); a writer needs a token.
+        /// `add_watch`: validate, spawn the local two-directory watch
+        /// thread, persist. §32: relay work registers via `add_converge`.
+        fn add_watch(&mut self, path: PathBuf, target: PathBuf) -> Result<EntryInfo> {
+            let path = path
+                .canonicalize()
+                .with_context(|| format!("canonicalize {}", path.display()))?;
+            let registration = Registration::Watch { path, target };
+            let worker = self.start(registration, None)?;
+            self.persist()?;
+            Ok(worker)
+        }
+
+        /// `add_converge` (§32): validate, spawn the converge loop, persist.
         #[allow(clippy::too_many_arguments)]
-        fn add_watch(
+        fn add_converge(
             &mut self,
             path: PathBuf,
-            target: Option<PathBuf>,
-            relay: Option<String>,
-            token: Option<String>,
+            relay: String,
+            token: String,
+            workspace: Option<String>,
             device: Option<String>,
-            force: bool,
             team: Option<String>,
             e2e: bool,
+            name: Option<String>,
             tls_ca_cert: Option<PathBuf>,
         ) -> Result<EntryInfo> {
             let path = path
                 .canonicalize()
                 .with_context(|| format!("canonicalize {}", path.display()))?;
-            match (&target, &relay) {
-                (Some(_), Some(_)) => {
-                    bail!("a watch takes either a target (local) or a relay (writer), not both")
-                }
-                (None, None) => bail!("a watch needs a target (local) or a relay (writer)"),
-                _ => {}
+            if relay.is_empty() {
+                bail!("a converge loop needs a relay URL");
             }
-            if relay.is_some() && token.as_deref().is_none_or(str::is_empty) {
-                bail!("a relay watch needs a bearer token");
+            if token.is_empty() {
+                bail!("a converge loop needs a bearer token");
             }
-            let registration = Registration::Watch {
+            let registration = Registration::Converge {
                 path,
-                target,
                 relay,
+                workspace,
                 device,
-                force,
                 team,
                 e2e,
+                name,
                 tls_ca_cert,
             };
-            let worker = self.start(registration, token)?;
+            let worker = self.start(registration, Some(token))?;
             self.persist()?;
             Ok(worker)
         }
@@ -143,9 +150,10 @@ mod server {
             Ok(worker)
         }
 
-        /// Register and spawn one workspace loop, refusing duplicates (two
-        /// writers on one workspace stay impossible by the lease, but the
-        /// same path twice in one daemon is always a mistake).
+        /// Register and spawn one workspace loop, refusing duplicates.
+        /// §32 made concurrent writers legal ACROSS devices, but two loops
+        /// on ONE directory are still always a mistake: they would fight
+        /// over the same `.pear` state and each other's conflict copies.
         fn start(
             &mut self,
             registration: Registration,
@@ -170,8 +178,8 @@ mod server {
         }
 
         /// `remove`: stop the loop and drop the registration. The thread
-        /// goes inert at its next cycle boundary and the lease is left to
-        /// expire (§16).
+        /// goes inert at its next cycle boundary; §32 holds nothing
+        /// relay-side, so there is nothing to release (§16).
         fn remove(&mut self, path: &Path) -> Result<()> {
             let key = key_of(path);
             let Some(worker) = self.workers.remove(&key) else {
@@ -227,8 +235,8 @@ mod server {
         }
 
         /// `shutdown`: every loop winds down at its next cycle boundary;
-        /// in-flight cycles finish, then the process exits. Leases are left
-        /// to expire — no special release (§16).
+        /// in-flight cycles finish, then the process exits. Nothing is
+        /// held relay-side, so there is no release step (§16).
         fn shutdown(&mut self) {
             let controls: Vec<Arc<LoopControl>> = self
                 .workers
@@ -273,31 +281,30 @@ mod server {
         let control = control.clone();
         std::thread::spawn(move || {
             let result = match &registration {
-                Registration::Watch {
+                Registration::Watch { path, target } => {
+                    loops::watch_local(path, target, &control, loops::print_report)
+                }
+                Registration::Converge {
                     path,
-                    target: Some(target),
-                    ..
-                } => loops::watch_local(path, target, &control, loops::print_report),
-                Registration::Watch {
-                    path,
-                    relay: Some(relay),
+                    relay,
+                    workspace,
                     device,
-                    force,
                     team,
                     e2e,
+                    name,
                     tls_ca_cert,
-                    ..
-                } => loops::watch_writer(
+                } => loops::converge(
                     path,
                     relay,
                     token.as_deref().unwrap_or(""),
+                    workspace.as_deref(),
                     device.clone(),
-                    *force,
                     team.clone(),
                     *e2e,
+                    name.as_deref(),
                     tls_ca_cert.as_deref(),
                     &control,
-                    loops::print_push_report,
+                    loops::print_converge_report,
                 ),
                 Registration::Mirror {
                     path,
@@ -315,9 +322,6 @@ mod server {
                     &control,
                     loops::print_pull_report,
                 ),
-                // Validated away at registration (a watch always has a
-                // target or a relay); never reached.
-                _ => Ok(()),
             };
             if let Err(e) = result {
                 eprintln!(
@@ -410,27 +414,22 @@ mod server {
 
     fn dispatch(request: Request, registry: &Arc<Mutex<Registry>>) -> Response {
         let result = match request {
-            Request::AddWatch {
+            Request::AddWatch { path, target } => lock(registry)
+                .add_watch(path, target)
+                .map(|entry| entry.to_json()),
+            Request::AddConverge {
                 path,
-                target,
                 relay,
                 token,
+                workspace,
                 device,
-                force,
                 team,
                 e2e,
+                name,
                 tls_ca_cert,
             } => lock(registry)
-                .add_watch(
-                    path,
-                    target,
-                    relay,
-                    token,
-                    device,
-                    force,
-                    team,
-                    e2e,
-                    tls_ca_cert,
+                .add_converge(
+                    path, relay, token, workspace, device, team, e2e, name, tls_ca_cert,
                 )
                 .map(|entry| entry.to_json()),
             Request::AddMirror {

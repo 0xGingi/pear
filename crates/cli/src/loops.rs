@@ -1,7 +1,11 @@
-//! The watch/mirror loop bodies, shared by the foreground `pear` CLI and
-//! the `peard` daemon's per-workspace threads (§16). Semantics are the
-//! pre-daemon ones, unchanged: the only seam is [`LoopControl`], which
-//! tells a loop how to report a fatal condition and when to wind down.
+//! The converge/watch/mirror loop bodies, shared by the foreground `pear`
+//! CLI and the `peard` daemon's per-workspace threads (§16). The only seam
+//! is [`LoopControl`], which tells a loop how to report a fatal condition
+//! and when to wind down.
+//!
+//! §32: the writer path is [`converge`] — one bidirectional loop per
+//! Writer device, no leases, driven by FS events + relay head hints +
+//! a poll fallback, all funneling into `converge_once`.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -9,13 +13,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use pear_core::converge::ConvergeReport;
 use pear_core::relay::{RelayClient, RelayError};
-use pear_core::sync::{CycleReport, PullReport, PushError, PushReport};
+use pear_core::sync::{CycleReport, PullReport, PushError};
 
-/// Writers heartbeat the lease every 30s (§11).
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Mirrors poll the head every 2s while the WebSocket feed is down (§11/§14).
+/// Mirrors and converge loops poll the head every 2s while the WebSocket
+/// feed is down (§11/§14/§32).
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// With a live WebSocket feed the poll relaxes to a 5-minute safety net
@@ -25,17 +28,18 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// it is the correctness floor, not a safety net.
 const POLL_INTERVAL_WS: Duration = Duration::from_secs(300);
 
-/// Exit code when this device loses the lease / head ownership mid-watch.
-const EXIT_LOST_LEASE: i32 = 3;
+/// Exit code when a loop hits a condition it can never recover from
+/// (auth/role revoked, a deterministic relay rejection).
+const EXIT_FATAL: i32 = 3;
 
 /// Supervision seam for a running sync loop (§16).
 ///
 /// The foreground CLI uses [`LoopControl::foreground`]: the stop flag is
-/// never set and a fatal (fencing/auth) condition prints and exits with
-/// `EXIT_LOST_LEASE` — byte-for-byte the pre-daemon behavior. A `peard`
-/// worker uses [`LoopControl::worker`]: `remove`/`shutdown` set the stop
-/// flag, a fatal condition is recorded for `status` instead of killing the
-/// daemon, and the loop goes inert rather than sync again.
+/// never set and a fatal (auth/deterministic) condition prints and exits
+/// with `EXIT_FATAL`. A `peard` worker uses [`LoopControl::worker`]:
+/// `remove`/`shutdown` set the stop flag, a fatal condition is recorded
+/// for `status` instead of killing the daemon, and the loop goes inert
+/// rather than sync again.
 pub struct LoopControl {
     stop: AtomicBool,
     in_cycle: AtomicBool,
@@ -64,7 +68,8 @@ impl LoopControl {
     }
 
     /// Ask the loop to wind down at its next cycle boundary (`remove`,
-    /// `shutdown`). Leases are left to expire — no special release (§16).
+    /// `shutdown`). §32: nothing is held relay-side, so there is nothing
+    /// to release.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
     }
@@ -73,8 +78,9 @@ impl LoopControl {
         self.stop.load(Ordering::SeqCst)
     }
 
-    /// The last committed (writer) or applied (mirror) head seq, for
-    /// `status`. 0 = none known yet.
+    /// The last converged (writer) or applied (mirror) head seq, for
+    /// `status` — and the companion thread's filter for head hints that
+    /// only echo our own commit. 0 = none known yet.
     pub fn set_head_seq(&self, seq: u64) {
         self.head_seq.store(seq, Ordering::SeqCst);
     }
@@ -96,13 +102,13 @@ impl LoopControl {
         self.error.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
-    /// A fatal (fencing/auth) condition. Foreground: print and exit with
-    /// `EXIT_LOST_LEASE`, the pre-daemon behavior. Daemon worker: record it
-    /// for `status`; the caller then goes inert via [`Self::park_if_done`].
+    /// A fatal (auth/deterministic) condition. Foreground: print and exit
+    /// with `EXIT_FATAL`. Daemon worker: record it for `status`; the
+    /// caller then goes inert via [`Self::park_if_done`].
     fn fatal(&self, message: String) {
         if self.exit_on_fatal {
             eprintln!("pear: {message}");
-            std::process::exit(EXIT_LOST_LEASE);
+            std::process::exit(EXIT_FATAL);
         }
         self.record_error(message);
     }
@@ -162,62 +168,227 @@ pub fn watch_local(
     )
 }
 
-/// Writer flow (§11): init, idempotent workspace create, lease acquire,
-/// heartbeat thread, then push every watch cycle. Losing the lease or the
-/// head is fatal — the foreground exits rather than push into someone
-/// else's generation; a daemon worker records the error and goes inert.
-/// With `team`, the workspace is attached to the team at register (§13).
-/// With `e2e`, the workspace is registered end-to-end encrypted (§17):
-/// the keyring (§20) is loaded or created at `.pear/workspace_keys` and,
-/// AFTER the lease is owned and BEFORE the first push, rotation-maintenance
-/// runs — a team member who VANISHED since the last recorded wrap rotates
-/// the keyring and loses their wrap row (§20), then every member whose
-/// signed bundle verifies and matches the known_keys pin gets the
-/// (possibly rotated) keyring wrapped to them (§19).
+/// §32 converge flow: init, idempotent workspace create (+ team attach),
+/// the §28 `.env` policy learn/pin, the §17/§19/§20 e2e key pass, then one
+/// bidirectional converge per trigger — forever.
+///
+/// Three triggers funnel into the same `converge_once` (§32): local
+/// filesystem events (the existing 500ms-quiet / 2s-cap debounce), relay
+/// `head_changed` hints over the §14 WebSocket feed, and a poll fallback
+/// (2s with the feed down, 5 minutes with it live). The last two are
+/// driven by the companion thread below, which kicks the watch loop
+/// through [`pear_core::watch::watch_loop_with_kicks`].
+///
+/// There is no lease and no fencing: `put_head`'s CAS on `base_seq` is the
+/// whole of the concurrency control, and `converge_once` re-merges against
+/// the winning head on a 409 internally. A 409 that escapes it (the bounded
+/// retry exhausted) is RETRYABLE, not fatal — another writer is simply
+/// publishing faster than this device can merge, and the next trigger tries
+/// again.
+///
+/// `workspace` adopts an existing relay workspace (`--workspace ID`, the
+/// join-into-an-empty-directory case); without it the workspace id is the
+/// local one, created on the relay if new. With `team`, the workspace is
+/// attached to the team at register (§13). With `e2e`, a new workspace is
+/// registered end-to-end encrypted (§17). `name` is the local identity
+/// used to unwrap an existing e2e workspace's key (§17), needed only when
+/// joining one this device has never held the key for.
 /// `tls_ca_cert` is the §17 private-CA PEM for the relay's TLS, if any.
+///
+/// §32 reader fallback: if the relay answers 403 to a converge push, this
+/// device has no Writer role. It says so once and degrades to the
+/// read-only mirror loop for the rest of the run instead of dying.
 #[allow(clippy::too_many_arguments)]
-pub fn watch_writer(
+pub fn converge(
     source: &Path,
     relay: &str,
     token: &str,
+    workspace: Option<&str>,
     device: Option<String>,
-    force: bool,
     team: Option<String>,
     e2e: bool,
+    name: Option<&str>,
     tls_ca_cert: Option<&Path>,
     control: &Arc<LoopControl>,
-    on_cycle: impl FnMut(&PushReport),
+    mut on_cycle: impl FnMut(&ConvergeReport),
 ) -> Result<()> {
     let device = device.unwrap_or_else(hostname);
     let tls_ca = resolve_tls_ca(tls_ca_cert)?;
-    let (meta, _) = pear_core::init_workspace(source, None)?;
+    // `--workspace ID` adopts the relay's id (join into an empty dir);
+    // otherwise the local `.pear` id is authoritative and gets created
+    // relay-side below. `init_workspace` refuses to re-target an existing
+    // workspace, so a mismatch is loud here rather than mid-converge.
+    let (meta, _) = pear_core::init_workspace(source, workspace)?;
     let client = RelayClient::with_tls_ca(relay, token, &meta.id, &device, tls_ca.as_deref())?;
+    let ws = register_workspace(&client, source, &meta.id, team.as_deref(), e2e)?;
+    learn_env_policy(&client)?;
+
+    // §17+§19+§20: the e2e key pass runs BEFORE the first converge. A
+    // device that already holds the ring uses it; one joining a workspace
+    // it has never held the key for fetches its own wrap and unwraps it
+    // with the `name` identity (§17); a freshly created workspace mints
+    // one. Rotation-maintenance then drops departed members' wraps (§20)
+    // and re-wraps the ring to the current team (§19) — merging the
+    // relay's copy of our own wrap in before it mints anything (§32).
+    let e2e_keyring = if ws.e2e {
+        let keys = crate::daemon::pear_home()?.join("keys");
+        let mut keyring = match pear_core::e2e::load_workspace_keyring(source)? {
+            Some(keyring) => keyring,
+            None if ws.existed => {
+                pear_core::e2e::workspace_key_for_reader(source, &client, &keys, name)?
+            }
+            None => pear_core::e2e::load_or_create_workspace_keyring(source)?,
+        };
+        let known_keys = crate::daemon::pear_home()?.join("known_keys");
+        let rotation = pear_core::e2e::rotation_maintenance(
+            &client,
+            source,
+            &mut keyring,
+            &known_keys,
+            &keys,
+            name,
+            false,
+        )?;
+        print_rotation_report(&rotation);
+        Some(keyring)
+    } else {
+        None
+    };
+
+    println!(
+        "converging {} <-> {} (workspace {}, device {device}, ctrl-c to stop)",
+        source.display(),
+        relay,
+        meta.id
+    );
+
+    // Triggers 2 and 3 (§32): head hints and the poll fallback. Teardown
+    // is by channel: when the watch loop below returns it drops its
+    // receiver, the forwarder's next send fails and it exits, which drops
+    // this thread's kick receiver, which ends this thread at its next
+    // wakeup. Nothing here outlives the loop by more than one poll.
+    let (kick_tx, kick_rx) = std::sync::mpsc::channel::<()>();
+    spawn_head_watcher(&client, control, kick_tx);
+
+    // Set once a 403 proves this device is a reader: the loop stops
+    // converging and finishes the run as a mirror (§32).
+    let mut demoted = false;
+    let outcome = pear_core::watch::watch_loop_with_kicks(
+        source,
+        Some(kick_rx),
+        |src| {
+            control.park_if_done();
+            let _cycle = control.enter_cycle();
+            match pear_core::converge::converge_once(src, &client, &device, e2e_keyring.as_ref()) {
+                Ok(report) => {
+                    control.set_head_seq(report.head_seq);
+                    Ok(report)
+                }
+                // §32: this device is not a Writer. Say so once and fall
+                // back to the read-only mirror loop.
+                Err(PushError::Forbidden(why)) => {
+                    demoted = true;
+                    println!(
+                        "pear: the relay refuses writes from this device (403: {why}); \
+                         continuing as a read-only mirror"
+                    );
+                    Err(anyhow::Error::new(pear_core::watch::StopWatching(
+                        anyhow::anyhow!("no writer role on workspace {}", client.workspace_id()),
+                    )))
+                }
+                Err(e @ PushError::Client(_)) => {
+                    control.fatal(format!("fatal converge error — {e}; exiting."));
+                    control.park_if_done();
+                    unreachable!(
+                        "fatal() exits the foreground; park_if_done() parks daemon workers"
+                    )
+                }
+                // A CAS conflict that outlived converge_once's own bounded
+                // retry is transient: the next trigger merges again.
+                Err(e @ PushError::HeadConflict { .. }) => Err(anyhow::Error::new(e)),
+                Err(PushError::Other(e)) => Err(e),
+            }
+        },
+        |report: &ConvergeReport| on_cycle(report),
+    );
+    if demoted {
+        return mirror(
+            source,
+            &meta.id,
+            relay,
+            token,
+            name,
+            tls_ca_cert,
+            control,
+            print_pull_report,
+        );
+    }
+    outcome
+}
+
+/// What `register_workspace` learned about the relay-side workspace.
+struct WorkspaceFacts {
+    /// §17: end-to-end encrypted (immutable, set at create).
+    e2e: bool,
+    /// The workspace was already registered before this loop started —
+    /// i.e. this is a join, not a create.
+    existed: bool,
+}
+
+/// Idempotent relay-side registration (§13/§17), shared by every converge
+/// start. An already-registered workspace is adopted with its recorded
+/// flavor; only a new one is created, and `--e2e` on an existing PLAIN
+/// workspace is an operator error, not a silent downgrade.
+fn register_workspace(
+    client: &RelayClient,
+    source: &Path,
+    id: &str,
+    team: Option<&str>,
+    e2e: bool,
+) -> Result<WorkspaceFacts> {
     // Attach at register: the team name resolves to an id passed along
     // with the idempotent create (a 409 keeps whatever the workspace
     // already has — registration happened earlier).
-    let team_id = match &team {
-        Some(name) => Some(find_team(&client, name)?.id),
+    let team_id = match team {
+        Some(name) => Some(find_team(client, name)?.id),
         None => None,
     };
-    // §17: e2e registration is immutable relay-side — a workspace already
-    // registered under the other flavor 409s (`e2e_mismatch`) here.
-    if e2e {
-        client.create_workspace_e2e(&workspace_name(source), team_id.as_deref())?;
-    } else {
-        client.create_workspace_with_team(&workspace_name(source), team_id.as_deref())?;
-    }
-    if let (Some(name), Some(team_id)) = (&team, &team_id) {
+    let existing = match client.get_workspace() {
+        Ok(ws) => Some(ws),
+        Err(RelayError::NotFound(_)) => None,
+        Err(e) => return Err(e.into()),
+    };
+    let ws_e2e = match &existing {
+        Some(ws) => {
+            if e2e && !ws.e2e {
+                bail!(
+                    "workspace {id} is already registered WITHOUT end-to-end encryption; \
+                     the flavor is immutable (§17) — drop --e2e or use a new workspace"
+                );
+            }
+            ws.e2e
+        }
+        None => {
+            if e2e {
+                client.create_workspace_e2e(&workspace_name(source), team_id.as_deref())?;
+            } else {
+                client.create_workspace_with_team(&workspace_name(source), team_id.as_deref())?;
+            }
+            e2e
+        }
+    };
+    if let (Some(name), Some(team_id)) = (team, &team_id) {
         // Attach explicitly only when needed: the relay's attach route is
         // owner-gated, and a team writer resuming an already-attached
-        // workspace must not be fenced out by a redundant call.
+        // workspace must not be refused by a redundant call.
         if client.get_workspace()?.team_id.as_deref() == Some(team_id.as_str()) {
-            println!("writer: workspace {} is attached to team {name}", meta.id);
+            println!("workspace {id} is attached to team {name}");
         } else {
             // Attachment is an owner concern, not a prerequisite for
             // writing the head: a failed attach (a non-owner writer, a
             // name conflict) warns and continues.
             match client.attach_team(team_id) {
-                Ok(()) => println!("writer: workspace {} registered in team {name}", meta.id),
+                Ok(()) => println!("workspace {id} registered in team {name}"),
                 Err(e) => eprintln!(
                     "pear: could not attach workspace to team {name} ({e}); \
                      continuing un-attached — the workspace owner can run `pear share --team {name}`"
@@ -225,137 +396,80 @@ pub fn watch_writer(
             }
         }
     }
-    // §28: learn the attached team's `.env` policy BEFORE the first push
-    // and pin it on the client — a forbidding team makes any cycle whose
-    // scan captures `.env*` files refuse loudly (fatal), the ONLY line
-    // for e2e and the early line for plaintext (the relay 409s too).
-    // Read-only calls, before the lease is touched: a refusing watch must
-    // never steal a lease. A team the writer cannot see in its own list
-    // (e.g. not a member) yields no policy here — the relay's 409 stays
-    // the backstop for plaintext.
-    if let Some(team_id) = client.get_workspace()?.team_id {
-        if let Some(t) = client
-            .list_teams()?
-            .into_iter()
-            .find(|t| t.id == team_id && !t.sync_env)
-        {
-            println!(
-                "writer: team {} forbids .env sync — this watch stops if .env* files appear",
-                t.name
-            );
-            client.set_env_sync_policy(Some(t.name));
-        }
+    Ok(WorkspaceFacts {
+        e2e: ws_e2e,
+        existed: existing.is_some(),
+    })
+}
+
+/// §28: learn the attached team's `.env` policy BEFORE the first converge
+/// and pin it on the client — a forbidding team makes any cycle whose scan
+/// captures `.env*` files refuse loudly (fatal), the ONLY line for e2e and
+/// the early line for plaintext (the relay 409s too). A team the device
+/// cannot see in its own list (e.g. not a member) yields no policy here —
+/// the relay's 409 stays the backstop for plaintext.
+fn learn_env_policy(client: &RelayClient) -> Result<()> {
+    let Some(team_id) = client.get_workspace()?.team_id else {
+        return Ok(());
+    };
+    if let Some(t) = client
+        .list_teams()?
+        .into_iter()
+        .find(|t| t.id == team_id && !t.sync_env)
+    {
+        println!(
+            "team {} forbids .env sync — this loop stops if .env* files appear",
+            t.name
+        );
+        client.set_env_sync_policy(Some(t.name));
     }
-    // The resume-safety check runs BEFORE touching the lease: acquire
-    // steals an expired lease, and a resume we then refuse would have
-    // fenced the sleeping writer for nothing.
-    let mut base_seq = pear_core::sync::writer_base_seq(source, &client, force)?;
-    // Takeover is explicit: --force revokes the current lease (and can
-    // strand the old writer's unsynced changes); otherwise acquire.
-    let generation = if force {
-        client.force()?
-    } else {
-        client.acquire()?
-    };
-    println!(
-        "writer: workspace {}, device {device}, lease generation {generation}",
-        meta.id
-    );
-    control.set_head_seq(base_seq);
+    Ok(())
+}
 
-    // §17+§19+§20: the e2e key pass runs with the lease owned and BEFORE
-    // the first push — only the lease holder may re-key, and between a
-    // member removal and this pass nothing new can be pushed, so the
-    // removal window has no silent exposure. Rotation-maintenance first
-    // (§20): a team member who VANISHED since the last recorded wrap
-    // rotates the keyring and loses their wrap row; a pure addition never
-    // rotates. The ordinary §19 wrap pass inside it then wraps the
-    // (possibly rotated) keyring to the current team.
-    let e2e_keyring = if e2e {
-        let mut keyring = pear_core::e2e::load_or_create_workspace_keyring(source)?;
-        let known_keys = crate::daemon::pear_home()?.join("known_keys");
-        let rotation =
-            pear_core::e2e::rotation_maintenance(&client, source, &mut keyring, &known_keys, false)?;
-        print_rotation_report(&rotation);
-        Some(keyring)
-    } else {
-        None
-    };
-
-    // Heartbeat keeps a crashed laptop from holding the workspace hostage;
-    // a 403 means this device has been fenced — die loudly (foreground) or
-    // go inert with the error recorded (daemon worker).
-    let heartbeat_client = client.clone();
-    let heartbeat_control = control.clone();
-    std::thread::spawn(move || loop {
-        std::thread::sleep(HEARTBEAT_INTERVAL);
-        if heartbeat_control.stopped() {
-            return;
-        }
-        match heartbeat_client.heartbeat() {
-            Ok(()) => {}
-            Err(RelayError::Fenced(why)) => {
-                heartbeat_control.fatal(format!(
-                    "LEASE LOST — fenced ({why}); another device owns the workspace. Exiting."
-                ));
+/// §32 triggers (b) and (c) for the converge loop: a companion thread that
+/// waits on the §14 head feed and kicks a converge on every hint, or on the
+/// poll timeout when no hint arrives (2s with the feed down — the
+/// correctness floor; 5 minutes with it live — a relay-bug safety net,
+/// §21). A relay without the `/ws` route leaves the feed absent and the
+/// thread degenerates into the 2s poll, exactly as a mirror does.
+///
+/// Hints whose seq is not ahead of what this device has already converged
+/// are dropped: the relay fans a commit out to every subscriber INCLUDING
+/// its author, and re-converging on the echo of our own push would double
+/// the work of every cycle for nothing.
+fn spawn_head_watcher(client: &RelayClient, control: &Arc<LoopControl>, kick: pear_core::watch::Kick) {
+    let client = client.clone();
+    let control = control.clone();
+    std::thread::spawn(move || {
+        let feed = client.head_changes();
+        loop {
+            if control.stopped() {
                 return;
             }
-            Err(RelayError::Http { status, body }) if matches!(status, 401 | 403) => {
-                heartbeat_control.fatal(format!(
-                    "heartbeat rejected (HTTP {status}): {body}. Token or role revoked? Exiting."
-                ));
+            match &feed {
+                Some(feed) => {
+                    let interval = if feed.connected() {
+                        POLL_INTERVAL_WS
+                    } else {
+                        POLL_INTERVAL
+                    };
+                    // A hint at or behind our own converged head is an
+                    // echo of our own commit: nothing new to merge
+                    // against, so keep waiting instead of converging.
+                    if let Ok(seq) = feed.recv_timeout(interval) {
+                        if seq <= control.head_seq() {
+                            continue;
+                        }
+                    }
+                }
+                None => std::thread::sleep(POLL_INTERVAL),
+            }
+            if kick.send(()).is_err() {
+                // The converge loop is gone: so is this thread.
                 return;
             }
-            Err(e) => eprintln!("pear: heartbeat failed, will retry: {e}"),
         }
     });
-
-    println!(
-        "watching {} -> {} (head seq {base_seq}, ctrl-c to stop)",
-        source.display(),
-        relay
-    );
-    // The first cycle after a forced takeover commits unconditionally:
-    // "this tree becomes the head", even when unchanged locally. The flag
-    // is consumed only once a cycle succeeds — a transient failure must
-    // not quietly drop the takeover.
-    let mut takeover = force;
-    pear_core::watch::watch_loop_with(
-        source,
-        |src| {
-            control.park_if_done();
-            let _cycle = control.enter_cycle();
-            let pushed = match &e2e_keyring {
-                Some(keyring) => {
-                    pear_core::sync::push_cycle_e2e(src, &client, base_seq, takeover, keyring)
-                }
-                None => pear_core::sync::push_cycle(src, &client, base_seq, takeover),
-            };
-            match pushed {
-                Ok(report) => {
-                    takeover = false;
-                    base_seq = report.head_seq;
-                    control.set_head_seq(report.head_seq);
-                    Ok(report)
-                }
-                Err(
-                    e @ (PushError::Fenced(_)
-                    | PushError::HeadConflict { .. }
-                    | PushError::Client(_)),
-                ) => {
-                    control.fatal(format!("fatal push error — {e}; exiting."));
-                    // The foreground never gets here (fatal exited); a
-                    // daemon worker parks instead of pushing again.
-                    control.park_if_done();
-                    unreachable!(
-                        "fatal() exits the foreground; park_if_done() parks daemon workers"
-                    )
-                }
-                Err(PushError::Other(e)) => Err(e),
-            }
-        },
-        on_cycle,
-    )
 }
 
 /// Mirror flow (§11/§14/§21): init with the remote workspace id, then apply
@@ -384,7 +498,7 @@ pub fn mirror(
     let client = RelayClient::with_tls_ca(relay, token, workspace, &hostname(), tls_ca.as_deref())?;
     let ws = client.get_workspace().map_err(|e| match e {
         RelayError::NotFound(_) => anyhow::anyhow!(
-            "relay has no workspace {workspace}; check the id, or create it with `pear watch --relay` on the writer"
+            "relay has no workspace {workspace}; check the id, or create it with `pear join --relay <url>` on a writer"
         ),
         other => anyhow::Error::new(other),
     })?;
@@ -402,7 +516,7 @@ pub fn mirror(
     }
     let (meta, _) = pear_core::init_workspace(path, Some(workspace))?;
     // §17: an e2e workspace needs its keyring. The writer wraps for team
-    // members at ITS watch start / share — a mirror that starts before
+    // members at ITS loop start / share — a mirror that starts before
     // its wrap exists must not die permanently: log and retry on the
     // poll interval until the wrap (or the identity keypair) appears.
     let e2e_keyring = if ws.e2e {
@@ -416,7 +530,7 @@ pub fn mirror(
                     }
                     eprintln!(
                         "pear: e2e workspace key not available yet ({e:#}); \
-                         retrying — the writer may need to re-run `pear watch --e2e` \
+                         retrying — a writer may need to re-run `pear join --e2e` \
                          or `pear share`, or you `pear user keygen`"
                     );
                     std::thread::sleep(POLL_INTERVAL);
@@ -547,35 +661,59 @@ pub fn print_report(r: &CycleReport) {
     println!("{line}");
 }
 
-pub fn print_push_report(r: &PushReport) {
-    if !r.committed {
-        println!("push: no changes (seq {})", r.head_seq);
+/// One line per converge (§32): what came down, what went up, and any
+/// conflict copies — the last of those is the line a user must never miss.
+pub fn print_converge_report(r: &ConvergeReport) {
+    if !r.pushed
+        && r.written.is_empty()
+        && r.deleted.is_empty()
+        && r.conflict_copies.is_empty()
+    {
         return;
     }
     let mut line = format!(
-        "push: seq {}; {} added, {} changed, {} deleted, {} chunks uploaded ({})",
+        "converge: seq {}; {} written, {} deleted, {} chunks up ({}), {} chunks down ({})",
         r.head_seq,
-        r.added.len(),
-        r.changed.len(),
+        r.written.len(),
         r.deleted.len(),
         r.chunks_uploaded,
-        human_bytes(r.bytes_uploaded)
+        human_bytes(r.bytes_uploaded),
+        r.chunks_fetched,
+        human_bytes(r.bytes_fetched)
     );
-    let mut wrote = r.added.clone();
-    wrote.extend(r.changed.iter().cloned());
-    if !wrote.is_empty() {
-        line.push_str(&format!("; wrote {}", wrote.join(", ")));
+    if !r.written.is_empty() {
+        line.push_str(&format!("; wrote {}", r.written.join(", ")));
     }
     if !r.deleted.is_empty() {
         line.push_str(&format!("; removed {}", r.deleted.join(", ")));
     }
     println!("{line}");
+    if !r.conflict_copies.is_empty() {
+        println!(
+            "conflict: both sides changed the same file — your version is kept as {}",
+            r.conflict_copies.join(", ")
+        );
+    }
 }
 
 /// The §20 lines of a rotation-maintenance pass (rotation + departures),
-/// then the ordinary §19 wrap report — shared by watch startup and
+/// then the ordinary §19 wrap report — shared by converge startup and
 /// `pear rekey`.
 pub fn print_rotation_report(r: &pear_core::e2e::RotationReport) {
+    // §32 merge-before-rotate, when it had something to say.
+    if !r.merged_from_relay.is_empty() {
+        println!(
+            "adopted key generation(s) {} from the relay before rotating",
+            r.merged_from_relay
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if let Some(why) = &r.merge_skipped {
+        println!("rotating on the local keyring alone: {why}");
+    }
     if r.rotated {
         println!(
             "rotated the workspace keyring to generation {}",
@@ -592,7 +730,7 @@ pub fn print_rotation_report(r: &pear_core::e2e::RotationReport) {
 }
 
 /// One line per wrap-maintenance outcome (§17/§19), shared by
-/// `pear share` and watch startup. `bad_sig` and `pin_changed` print as
+/// `pear share` and converge startup. `bad_sig` and `pin_changed` print as
 /// warnings, not errors: the pass itself succeeded; those members were
 /// simply never wrapped to.
 pub fn print_wrap_report(wrap: &pear_core::e2e::WrapReport) {
@@ -601,7 +739,7 @@ pub fn print_wrap_report(wrap: &pear_core::e2e::WrapReport) {
     }
     if !wrap.skipped.is_empty() {
         println!(
-            "skipped members with no registered key (they gain access after `pear user keygen` + your next watch/share): {}",
+            "skipped members with no registered key (they gain access after `pear user keygen` + your next converge/share): {}",
             wrap.skipped.join(", ")
         );
     }

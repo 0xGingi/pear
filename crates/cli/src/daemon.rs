@@ -37,19 +37,27 @@ pub fn state_path(home: &Path) -> PathBuf {
 }
 
 /// A client request: one JSON line on the socket.
+///
+/// §32 BREAKING CHANGE: `add_watch` is now the LOCAL two-directory watch
+/// only (`target` is required, and the relay/lease fields are gone), and
+/// relay work registers as `add_converge`. A `daemon.json` written by a
+/// pre-§32 peard holding relay watches fails to load on the role field —
+/// personal project, no migration: delete it and re-`join`.
 pub enum Request {
-    /// `{"type":"add_watch","path":..,"target":..|null,"relay":..|null,
-    /// "token":..|null,"device":..|null,"force":bool,"team":..|null,
-    /// "e2e":bool,"tls_ca_cert":..|null}`
-    AddWatch {
+    /// `{"type":"add_watch","path":..,"target":..}`
+    AddWatch { path: PathBuf, target: PathBuf },
+    /// `{"type":"add_converge","path":..,"relay":..,"token":..,
+    /// "workspace":..|null,"device":..|null,"team":..|null,"e2e":bool,
+    /// "name":..|null,"tls_ca_cert":..|null}` — the §32 converge loop.
+    AddConverge {
         path: PathBuf,
-        target: Option<PathBuf>,
-        relay: Option<String>,
-        token: Option<String>,
+        relay: String,
+        token: String,
+        workspace: Option<String>,
         device: Option<String>,
-        force: bool,
         team: Option<String>,
         e2e: bool,
+        name: Option<String>,
         tls_ca_cert: Option<PathBuf>,
     },
     /// `{"type":"add_mirror","path":..,"workspace":..,"relay":..,"token":..,
@@ -75,26 +83,31 @@ pub enum Request {
 impl Request {
     pub fn to_json(&self) -> Value {
         match self {
-            Request::AddWatch {
-                path,
-                target,
-                relay,
-                token,
-                device,
-                force,
-                team,
-                e2e,
-                tls_ca_cert,
-            } => json!({
+            Request::AddWatch { path, target } => json!({
                 "type": "add_watch",
                 "path": path.to_string_lossy(),
-                "target": target.as_ref().map(|t| t.to_string_lossy()),
+                "target": target.to_string_lossy(),
+            }),
+            Request::AddConverge {
+                path,
+                relay,
+                token,
+                workspace,
+                device,
+                team,
+                e2e,
+                name,
+                tls_ca_cert,
+            } => json!({
+                "type": "add_converge",
+                "path": path.to_string_lossy(),
                 "relay": relay,
                 "token": token,
+                "workspace": workspace,
                 "device": device,
-                "force": force,
                 "team": team,
                 "e2e": e2e,
+                "name": name,
                 "tls_ca_cert": tls_ca_cert.as_ref().map(|t| t.to_string_lossy()),
             }),
             Request::AddMirror {
@@ -131,13 +144,17 @@ impl Request {
         match opt_str(v, "type")?.as_deref() {
             Some("add_watch") => Ok(Request::AddWatch {
                 path: PathBuf::from(req_str(v, "path")?),
-                target: opt_str(v, "target")?.map(PathBuf::from),
-                relay: opt_str(v, "relay")?,
-                token: opt_str(v, "token")?,
+                target: PathBuf::from(req_str(v, "target")?),
+            }),
+            Some("add_converge") => Ok(Request::AddConverge {
+                path: PathBuf::from(req_str(v, "path")?),
+                relay: req_str(v, "relay")?,
+                token: req_str(v, "token")?,
+                workspace: opt_str(v, "workspace")?,
                 device: opt_str(v, "device")?,
-                force: opt_bool(v, "force")?,
                 team: opt_str(v, "team")?,
                 e2e: opt_bool(v, "e2e")?,
+                name: opt_str(v, "name")?,
                 tls_ca_cert: opt_str(v, "tls_ca_cert")?.map(PathBuf::from),
             }),
             Some("add_mirror") => Ok(Request::AddMirror {
@@ -218,7 +235,7 @@ impl Response {
 /// carries a token (§16).
 pub struct EntryInfo {
     pub path: PathBuf,
-    /// "watch" | "mirror"
+    /// "sync" (§32 converge) | "watch" (local) | "mirror"
     pub role: String,
     pub target: Option<PathBuf>,
     pub relay: Option<String>,
@@ -269,14 +286,17 @@ impl EntryInfo {
     /// One-line summary for CLI confirmations.
     pub fn summary(&self) -> String {
         match self.role.as_str() {
-            "watch" => match (&self.relay, &self.target) {
-                (Some(relay), _) => {
-                    format!("watch {} (writer, relay {relay})", self.path.display())
-                }
-                (None, Some(target)) => {
+            "sync" => format!(
+                "sync {} (workspace {}, relay {})",
+                self.path.display(),
+                self.workspace.as_deref().unwrap_or("local id"),
+                self.relay.as_deref().unwrap_or("?")
+            ),
+            "watch" => match &self.target {
+                Some(target) => {
                     format!("watch {} -> {}", self.path.display(), target.display())
                 }
-                (None, None) => format!("watch {}", self.path.display()),
+                None => format!("watch {}", self.path.display()),
             },
             "mirror" => format!(
                 "mirror {} (workspace {}, relay {})",
@@ -294,16 +314,19 @@ impl EntryInfo {
 /// §17 CA, if any, is a PATH (public cert material), read at loop start.
 #[derive(Clone)]
 pub enum Registration {
-    Watch {
+    /// §32: one bidirectional converge loop for a relay workspace.
+    Converge {
         path: PathBuf,
-        target: Option<PathBuf>,
-        relay: Option<String>,
+        relay: String,
+        workspace: Option<String>,
         device: Option<String>,
-        force: bool,
         team: Option<String>,
         e2e: bool,
+        name: Option<String>,
         tls_ca_cert: Option<PathBuf>,
     },
+    /// Local two-directory watch (no relay).
+    Watch { path: PathBuf, target: PathBuf },
     Mirror {
         path: PathBuf,
         workspace: String,
@@ -316,7 +339,9 @@ pub enum Registration {
 impl Registration {
     pub fn path(&self) -> &Path {
         match self {
-            Registration::Watch { path, .. } | Registration::Mirror { path, .. } => path,
+            Registration::Converge { path, .. }
+            | Registration::Watch { path, .. }
+            | Registration::Mirror { path, .. } => path,
         }
     }
 
@@ -327,6 +352,7 @@ impl Registration {
 
     pub fn role(&self) -> &'static str {
         match self {
+            Registration::Converge { .. } => "sync",
             Registration::Watch { .. } => "watch",
             Registration::Mirror { .. } => "mirror",
         }
@@ -334,17 +360,17 @@ impl Registration {
 
     /// Relay workspaces need a bearer token to run; local watches do not.
     pub fn needs_token(&self) -> bool {
-        match self {
-            Registration::Watch { relay, .. } => relay.is_some(),
-            Registration::Mirror { .. } => true,
-        }
+        !matches!(self, Registration::Watch { .. })
     }
 
     /// The live status view of a registered worker.
     pub fn entry_info(&self, control: &LoopControl) -> EntryInfo {
         let error = control.error();
         let (target, relay, workspace) = match self {
-            Registration::Watch { target, relay, .. } => (target.clone(), relay.clone(), None),
+            Registration::Converge {
+                relay, workspace, ..
+            } => (None, Some(relay.clone()), workspace.clone()),
+            Registration::Watch { target, .. } => (Some(target.clone()), None, None),
             Registration::Mirror {
                 workspace, relay, ..
             } => (None, Some(relay.clone()), Some(workspace.clone())),
@@ -370,25 +396,30 @@ impl Registration {
 
     pub fn to_json(&self) -> Value {
         match self {
-            Registration::Watch {
+            Registration::Converge {
                 path,
-                target,
                 relay,
+                workspace,
                 device,
-                force,
                 team,
                 e2e,
+                name,
                 tls_ca_cert,
             } => json!({
-                "role": "watch",
+                "role": "sync",
                 "path": path.to_string_lossy(),
-                "target": target.as_ref().map(|t| t.to_string_lossy()),
                 "relay": relay,
+                "workspace": workspace,
                 "device": device,
-                "force": force,
                 "team": team,
                 "e2e": e2e,
+                "name": name,
                 "tls_ca_cert": tls_ca_cert.as_ref().map(|t| t.to_string_lossy()),
+            }),
+            Registration::Watch { path, target } => json!({
+                "role": "watch",
+                "path": path.to_string_lossy(),
+                "target": target.to_string_lossy(),
             }),
             Registration::Mirror {
                 path,
@@ -409,15 +440,19 @@ impl Registration {
 
     pub fn from_json(v: &Value) -> Result<Registration> {
         match opt_str(v, "role")?.as_deref() {
-            Some("watch") => Ok(Registration::Watch {
+            Some("sync") => Ok(Registration::Converge {
                 path: PathBuf::from(req_str(v, "path")?),
-                target: opt_str(v, "target")?.map(PathBuf::from),
-                relay: opt_str(v, "relay")?,
+                relay: req_str(v, "relay")?,
+                workspace: opt_str(v, "workspace")?,
                 device: opt_str(v, "device")?,
-                force: opt_bool(v, "force")?,
                 team: opt_str(v, "team")?,
                 e2e: opt_bool(v, "e2e")?,
+                name: opt_str(v, "name")?,
                 tls_ca_cert: opt_str(v, "tls_ca_cert")?.map(PathBuf::from),
+            }),
+            Some("watch") => Ok(Registration::Watch {
+                path: PathBuf::from(req_str(v, "path")?),
+                target: PathBuf::from(req_str(v, "target")?),
             }),
             Some("mirror") => Ok(Registration::Mirror {
                 path: PathBuf::from(req_str(v, "path")?),

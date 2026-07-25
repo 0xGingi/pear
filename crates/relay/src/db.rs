@@ -1,4 +1,4 @@
-//! Relay metadata: workspace registry, head log, leases (§11), snapshots
+//! Relay metadata: workspace registry, head log (§11), snapshots
 //! (§12), users/teams/memberships (§13), and the §17/§19 E2E envelope
 //! state (user key bundles, per-member wrapped workspace keys). No
 //! migrations framework — `CREATE TABLE IF NOT EXISTS` plus idempotent
@@ -9,13 +9,6 @@
 use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
-
-/// Current lease row for a workspace.
-pub(crate) struct Lease {
-    pub(crate) holder: String,
-    pub(crate) generation: i64,
-    pub(crate) expires_at: i64,
-}
 
 /// A workspace row (§13): `owner` is the creating user's name (`None` =
 /// pre-M4 or admin-created, treated as admin-owned), `team_id` the single
@@ -83,7 +76,8 @@ pub(crate) struct Head {
 }
 
 /// A snapshot row (§12): an immutable manifest plus metadata. `kind` is
-/// `named` (CLI-made) or `checkpoint` (relay-made on lease force).
+/// `named` (CLI-made); `checkpoint` rows exist only in data dirs written
+/// by pre-§32 relays, which made them on lease force.
 pub(crate) struct Snapshot {
     pub(crate) id: i64,
     pub(crate) name: Option<String>,
@@ -243,9 +237,9 @@ impl Db {
         // database. Rollback is safe here because every class of relay
         // state is re-executable or loudly comparable: chunk refs
         // re-insert unconditionally on re-upload, put_head CASes on
-        // base_seq and every idle check compares seq AND hash, lease
-        // safety rests on head CAS (a rolled-back lease can only fence
-        // loudly), and a rolled-back snapshot 404s at restore —
+        // base_seq and every idle check compares seq AND hash (§32: that
+        // CAS is the only concurrency control), and a rolled-back
+        // snapshot 404s at restore —
         // DESIGN.md §22, "Why rollback is safe here".
         //
         // `journal_mode=WAL` is a getter: it RETURNS the mode now in
@@ -308,12 +302,8 @@ impl Db {
                 manifest TEXT NOT NULL,
                 PRIMARY KEY (workspace_id, seq)
             );
-            CREATE TABLE IF NOT EXISTS leases (
-                workspace_id TEXT PRIMARY KEY,
-                holder TEXT NOT NULL,
-                generation INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL
-            );
+            -- §32 retired leases: pre-§32 data dirs keep an orphaned
+            -- `leases` table that is never read again (no migration).
             CREATE TABLE IF NOT EXISTS snapshots (
                 workspace_id TEXT NOT NULL,
                 id INTEGER NOT NULL,
@@ -828,75 +818,6 @@ impl Db {
             params![workspace_id],
             |row| row.get(0),
         )
-    }
-
-    /// Test hook: rewrite a snapshot's timestamp to simulate age for §14
-    /// retention tests (production timestamps are always insert-time).
-    #[cfg(test)]
-    pub(crate) fn backdate_snapshot(
-        &self,
-        workspace_id: &str,
-        id: i64,
-        created_at: i64,
-    ) -> rusqlite::Result<()> {
-        self.conn.execute(
-            "UPDATE snapshots SET created_at = ?3 WHERE workspace_id = ?1 AND id = ?2",
-            params![workspace_id, id, created_at],
-        )?;
-        Ok(())
-    }
-
-    /// Manifest of the newest checkpoint snapshot, if any (dedupe for
-    /// `lease/force`: repeat forces of an unchanged head must not pile up
-    /// byte-identical rows).
-    pub(crate) fn latest_checkpoint_manifest(
-        &self,
-        workspace_id: &str,
-    ) -> rusqlite::Result<Option<String>> {
-        self.conn
-            .query_row(
-                "SELECT manifest FROM snapshots
-                 WHERE workspace_id = ?1 AND kind = 'checkpoint'
-                 ORDER BY id DESC LIMIT 1",
-                params![workspace_id],
-                |row| row.get(0),
-            )
-            .optional()
-    }
-
-    pub(crate) fn get_lease(&self, workspace_id: &str) -> rusqlite::Result<Option<Lease>> {
-        self.conn
-            .query_row(
-                "SELECT holder, generation, expires_at FROM leases WHERE workspace_id = ?1",
-                params![workspace_id],
-                |row| {
-                    Ok(Lease {
-                        holder: row.get(0)?,
-                        generation: row.get(1)?,
-                        expires_at: row.get(2)?,
-                    })
-                },
-            )
-            .optional()
-    }
-
-    pub(crate) fn put_lease(
-        &self,
-        workspace_id: &str,
-        holder: &str,
-        generation: i64,
-        expires_at: i64,
-    ) -> rusqlite::Result<()> {
-        self.conn.execute(
-            "INSERT INTO leases (workspace_id, holder, generation, expires_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT (workspace_id) DO UPDATE SET
-                holder = excluded.holder,
-                generation = excluded.generation,
-                expires_at = excluded.expires_at",
-            params![workspace_id, holder, generation, expires_at],
-        )?;
-        Ok(())
     }
 
     /// Append a snapshot; returns its per-workspace incrementing id (§12).

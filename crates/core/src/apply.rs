@@ -37,6 +37,28 @@ pub fn apply(
     new: &Manifest,
     chunks: &dyn ChunkSource,
 ) -> Result<ApplyReport> {
+    apply_commit(target, old, new, chunks, new)
+}
+
+/// [`apply`] with the committed manifest pointer decoupled from the tree
+/// state applied: the batch converges the tree to `new`, but
+/// `.pear/manifest.json` ends up holding `commit`.
+///
+/// §32 needs this: converge applies `merged` to the tree BEFORE the head
+/// that publishes it is committed, and `.pear/manifest.json` is the 3-way
+/// merge's `base` — the last state this device and the relay AGREED on.
+/// Recording `merged` there before the push would, after a crash, make the
+/// next merge read our unpublished edits as "unchanged since base" and let
+/// the older remote head overwrite them. Converge therefore commits the
+/// remote head it merged against, which stays a correct common ancestor of
+/// the applied tree and any newer head.
+pub fn apply_commit(
+    target: &Path,
+    old: &Manifest,
+    new: &Manifest,
+    chunks: &dyn ChunkSource,
+    commit: &Manifest,
+) -> Result<ApplyReport> {
     // Manifests are disk and network data; never join unchecked paths, and
     // never resolve a destination through a symlinked ancestor inside the
     // target (checked per file in write_file/delete_file below).
@@ -133,7 +155,7 @@ pub fn apply(
     }
 
     // The apply batch is durable only once the manifest pointer moves.
-    manifest::write_atomic(&pear_dir.join("manifest.json"), new)?;
+    manifest::write_atomic(&pear_dir.join("manifest.json"), commit)?;
 
     Ok(ApplyReport { written, deleted })
 }
